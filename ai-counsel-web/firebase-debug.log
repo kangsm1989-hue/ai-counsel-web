@@ -1,0 +1,57 @@
+[debug] [2026-02-24T10:02:02.502Z] ----------------------------------------------------------------------
+[debug] [2026-02-24T10:02:02.505Z] Command:       C:\Program Files\nodejs\node.exe C:\Users\SBKW5_07\AppData\Roaming\npm\node_modules\firebase-tools\lib\bin\firebase.js init hosting
+[debug] [2026-02-24T10:02:02.505Z] CLI Version:   15.7.0
+[debug] [2026-02-24T10:02:02.505Z] Platform:      win32
+[debug] [2026-02-24T10:02:02.505Z] Node Version:  v24.13.1
+[debug] [2026-02-24T10:02:02.505Z] Time:          Tue Feb 24 2026 19:02:02 GMT+0900 (한국 표준시)
+[debug] [2026-02-24T10:02:02.505Z] ----------------------------------------------------------------------
+[debug] 
+[info] 
+     ######## #### ########  ######## ########     ###     ######  ########
+     ##        ##  ##     ## ##       ##     ##  ##   ##  ##       ##
+     ######    ##  ########  ######   ########  #########  ######  ######
+     ##        ##  ##    ##  ##       ##     ## ##     ##       ## ##
+     ##       #### ##     ## ######## ########  ##     ##  ######  ########
+
+You're about to initialize a Firebase project in this directory:
+
+  C:\Users\SBKW5_07\ai-counsel-web
+
+[info] 
+=== Project Setup
+[info] 
+[info] First, let's associate this project directory with a Firebase project.
+[info] You can create multiple project aliases by running firebase use --add, 
+[info] 
+[debug] [2026-02-24T10:03:55.048Z] > command requires scopes: ["email","openid","https://www.googleapis.com/auth/cloudplatformprojects.readonly","https://www.googleapis.com/auth/firebase","https://www.googleapis.com/auth/cloud-platform"]
+[debug] [2026-02-24T10:03:55.049Z] > authorizing via signed-in user (kangsm1989@gmail.com)
+[debug] [2026-02-24T10:03:55.050Z] Checked if tokens are valid: true, expires at: 1771930907334
+[debug] [2026-02-24T10:03:55.050Z] Checked if tokens are valid: true, expires at: 1771930907334
+[debug] [2026-02-24T10:03:55.050Z] >>> [apiv2][query] GET https://firebase.googleapis.com/v1beta1/projects pageSize=100
+[debug] [2026-02-24T10:03:55.735Z] <<< [apiv2][status] GET https://firebase.googleapis.com/v1beta1/projects 200
+[debug] [2026-02-24T10:03:55.735Z] <<< [apiv2][body] GET https://firebase.googleapis.com/v1beta1/projects [omitted]
+[info] 
+=== Hosting Setup
+[debug] [2026-02-24T10:04:49.593Z] Checked if tokens are valid: true, expires at: 1771930907334
+[debug] [2026-02-24T10:04:49.593Z] Checked if tokens are valid: true, expires at: 1771930907334
+[debug] [2026-02-24T10:04:49.593Z] >>> [apiv2][query] GET https://firebase.googleapis.com/v1beta1/projects/ai-cousel [none]
+[debug] [2026-02-24T10:04:50.027Z] <<< [apiv2][status] GET https://firebase.googleapis.com/v1beta1/projects/ai-cousel 200
+[debug] [2026-02-24T10:04:50.028Z] <<< [apiv2][body] GET https://firebase.googleapis.com/v1beta1/projects/ai-cousel {"projectId":"ai-cousel","projectNumber":"420613637107","displayName":"AI-cousel","name":"projects/ai-cousel","resources":{"hostingSite":"ai-cousel"},"state":"ACTIVE","etag":"1_4253407f-a85f-4fc9-a103-3bc08a9dde4d"}
+[info] 
+[info] Your public directory is the folder (relative to your project directory) that
+[info] will contain Hosting assets to be uploaded with firebase deploy. If you
+[info] have a build process for your assets, use your build's output directory.
+[info] 
+[debug] [2026-02-24T10:06:08.520Z] ExitPromptError: User force closed the prompt with SIGINT
+    at Interface.sigint (C:\Users\SBKW5_07\AppData\Roaming\npm\node_modules\firebase-tools\node_modules\@inquirer\core\dist\commonjs\lib\create-prompt.js:101:37)
+    at Interface.emit (node:events:508:28)
+    at [_ttyWrite] [as _ttyWrite] (node:internal/readline/interface:1327:18)
+    at ReadStream.onkeypress (node:internal/readline/interface:284:20)
+    at ReadStream.emit (node:events:520:35)
+    at emitKeys (node:internal/readline/utils:371:14)
+    at emitKeys.next (<anonymous>)
+    at ReadStream.onData (node:internal/readline/emitKeypressEvents:64:36)
+    at ReadStream.emit (node:events:508:28)
+    at addChunk (node:internal/streams/readable:559:12)
+[error] 
+[error] Error: An unexpected error has occurred.
