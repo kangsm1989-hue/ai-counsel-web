@@ -13,18 +13,52 @@ function isRisky(text: string) {
   return keywords.some((k) => t.includes(k));
 }
 
-function buildPrompt(message: string, track?: string) {
+function buildPrompt(message: string, track?: string, technique?: string) {
   const trackHint =
     track === "진로"
-      ? "진로 상담 맥락으로 질문을 명확히 하고 선택지를 정리해줘."
+      ? "진로 상담 맥락으로 목표/선택지를 구조화해줘."
       : track === "정서"
-      ? "정서 상담 맥락으로 공감과 현실적인 다음 행동 1~2개를 제안해줘."
+      ? "정서 상담 맥락으로 감정 조절과 일상 실행 전략을 제안해줘."
+      : track === "양육"
+      ? "양육 상담 맥락으로 부모-아이 상호작용과 현실적 루틴을 제안해줘."
       : "상담 맥락으로 과도한 단정 없이 안전하고 실용적으로 답해줘.";
+
+  const techniqueHint =
+    technique === "gestalt"
+      ? "게슈탈트 기법: 지금-여기 경험, 감정 자각, 회피 패턴 인식을 중심으로 답변."
+      : technique === "psychoanalysis"
+      ? "정신분석학 기법: 과거 경험, 무의식적 갈등, 반복 패턴 탐색 질문 중심으로 답변."
+      : technique === "humanistic"
+      ? "인간중심 기법: 공감, 무조건적 수용, 자기이해 촉진 질문 중심으로 답변."
+      : technique === "behaviorism"
+      ? "행동주의 기법: 구체 행동 목표, 촉발요인-행동-결과 분석, 강화 계획 중심으로 답변."
+      : "REBT 기법: 비합리적 신념을 찾아 ABCDE 구조로 재구성.";
+
+  const responseFormat =
+    technique === "rebt" || !technique
+      ? [
+          "응답 형식:",
+          "1) 공감 요약(2문장 이내)",
+          "2) A(사건) / B(신념) / C(결과) 정리",
+          "3) D(비합리적 신념 논박 질문 2~3개)",
+          "4) E(새로운 관점과 실천 2가지)",
+          "5) 필요 시 안전 안내",
+        ]
+      : [
+          "응답 형식:",
+          "1) 공감 요약",
+          "2) 선택한 기법 기준 핵심 해석",
+          "3) 실천 가능한 행동 2~3개",
+          "4) 다음 상담에서 점검할 질문 1~2개",
+          "5) 필요 시 안전 안내",
+        ];
 
   return [
     "너는 따뜻하고 실용적인 상담형 AI야.",
     "금지: 의료/법률 확정 진단, 과도한 단정, 위험 행동 조장.",
     `추가 지시: ${trackHint}`,
+    `상담 기법 지시: ${techniqueHint}`,
+    ...responseFormat,
     "",
     `사용자: ${message}`,
     "상담자:",
@@ -43,6 +77,7 @@ export async function POST(req: Request) {
     const body = await req.json();
     const message = body?.message ?? "";
     const track = body?.track ?? "";
+    const technique = body?.technique ?? "rebt";
 
     if (typeof message !== "string" || !message.trim()) {
       return new Response(JSON.stringify({ reply: "메시지가 비어 있어요." }), {
@@ -66,12 +101,12 @@ export async function POST(req: Request) {
     const model = process.env.REPLICATE_MODEL || "openai/gpt-5-mini";
 
     const input = {
-      prompt: buildPrompt(message, track),
+      prompt: buildPrompt(message, track, technique),
       temperature: 0.7,
       max_new_tokens: 256,
     };
 
-    const output = await replicate.run(model as any, { input });
+    const output = await replicate.run(model as `${string}/${string}`, { input });
 
     let reply = "";
     if (typeof output === "string") reply = output;
@@ -82,11 +117,11 @@ export async function POST(req: Request) {
       status: 200,
       headers: { "Content-Type": "application/json; charset=utf-8" },
     });
-  } catch (err: any) {
+  } catch (err: unknown) {
     return new Response(
       JSON.stringify({
         reply: "Replicate 호출 오류",
-        detail: err?.message ?? String(err),
+        detail: err instanceof Error ? err.message : String(err),
       }),
       { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } }
     );
