@@ -32,10 +32,12 @@ function buildPrompt(message: string, track?: string, technique?: string) {
       ? "인간중심 기법: 공감, 무조건적 수용, 자기이해 촉진 질문 중심으로 답변."
       : technique === "behaviorism"
       ? "행동주의 기법: 구체 행동 목표, 촉발요인-행동-결과 분석, 강화 계획 중심으로 답변."
+      : technique === "blended"
+      ? "일반 AI 대화 모드: 특정 상담 프레임을 강요하지 말고, 자연스러운 대화체로 사용자의 질문 의도에 맞게 답변."
       : "REBT 기법: 비합리적 신념을 찾아 ABCDE 구조로 재구성.";
 
   const responseFormat =
-    technique === "rebt" || !technique
+    technique === "rebt"
       ? [
           "응답 형식:",
           "1) 공감 요약(2문장 이내)",
@@ -43,6 +45,13 @@ function buildPrompt(message: string, track?: string, technique?: string) {
           "3) D(비합리적 신념 논박 질문 2~3개)",
           "4) E(새로운 관점과 실천 2가지)",
           "5) 필요 시 안전 안내",
+        ]
+      : technique === "blended"
+      ? [
+          "응답 형식:",
+          "1) 질문 의도에 대한 직접 답변",
+          "2) 필요하면 선택지/예시 제시",
+          "3) 위험 신호가 있을 때만 안전 안내",
         ]
       : [
           "응답 형식:",
@@ -76,8 +85,9 @@ export async function POST(req: Request) {
 
     const body = await req.json();
     const message = body?.message ?? "";
+    const riskMessage = body?.riskMessage ?? message;
     const track = body?.track ?? "";
-    const technique = body?.technique ?? "rebt";
+    const technique = body?.technique ?? "blended";
 
     if (typeof message !== "string" || !message.trim()) {
       return new Response(JSON.stringify({ reply: "메시지가 비어 있어요." }), {
@@ -86,7 +96,7 @@ export async function POST(req: Request) {
       });
     }
 
-    if (track === "위기" || isRisky(message)) {
+    if (isRisky(String(riskMessage))) {
       return new Response(
         JSON.stringify({
           reply:

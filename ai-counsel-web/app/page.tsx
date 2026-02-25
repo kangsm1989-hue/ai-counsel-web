@@ -1,8 +1,9 @@
 ﻿"use client";
 
-import { type KeyboardEvent, useEffect, useMemo, useState } from "react";
+import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   createUserWithEmailAndPassword,
+  deleteUser,
   GoogleAuthProvider,
   onAuthStateChanged,
   signInAnonymously,
@@ -14,17 +15,46 @@ import { auth, db } from "./lib/firebase";
 import {
   addDoc,
   collection,
+  deleteDoc,
   doc,
+  getDoc,
+  getDocs,
   limit,
   onSnapshot,
   orderBy,
   query,
   serverTimestamp,
   setDoc,
+  updateDoc,
   where,
+  writeBatch,
 } from "firebase/firestore";
 
 type Msg = { role: "user" | "assistant"; text: string };
+type ChatThread = {
+  id: string;
+  title: string;
+  createdAt?: unknown;
+  lastMessageAt?: unknown;
+};
+type UserProfile = {
+  uid: string;
+  nickname: string;
+  accountId: string;
+  contact: string;
+  consentAdminView: boolean;
+  disabled: boolean;
+  createdAt?: unknown;
+};
+type DeleteRequest = {
+  uid: string;
+  accountId: string;
+  nickname: string;
+  reason: string;
+  status: "pending" | "processed";
+  requestedAt?: unknown;
+  processedAt?: unknown;
+};
 type TrackId = "career" | "emotion" | "parenting" | "crisis";
 type TestId =
   | "career-fit"
@@ -32,8 +62,15 @@ type TestId =
   | "depression-check"
   | "personality-test"
   | "sct-test";
-type TabId = "counsel" | "diary" | "child" | "tests";
-type TechniqueId = "gestalt" | "psychoanalysis" | "rebt" | "humanistic" | "behaviorism";
+type TabId = "counsel" | "diary" | "child" | "tests" | "admin";
+type TechniqueId =
+  | "gestalt"
+  | "psychoanalysis"
+  | "rebt"
+  | "humanistic"
+  | "behaviorism"
+  | "blended";
+type DiaryModeId = "general" | "abc" | "guided" | "reflection";
 
 type Track = {
   id: TrackId;
@@ -65,7 +102,6 @@ type IntakeForm = {
   currentSituation: string;
   periodFrequency: string;
   hardestPoint: string;
-  helpStyle: string;
 };
 
 type TestResultRow = {
@@ -77,8 +113,27 @@ type TestResultRow = {
 type JournalEntry = {
   id: string;
   uid: string;
+  authorLabel: string;
   date: string;
+  mode?: DiaryModeId;
+  fortuneId?: string;
+  fortuneText?: string;
+  missionText?: string;
+  missionCompleted?: boolean;
+  medicationRecord?: {
+    status: "taken" | "partial" | "skipped";
+    times: string[];
+    name: string;
+    category: string;
+    note: string;
+    missedReason: string;
+  } | null;
   mood: number;
+  energy: number;
+  relationship: number;
+  achievement: number;
+  emotions: string[];
+  reflection: string;
   text: string;
   createdAt?: unknown;
 };
@@ -88,11 +143,13 @@ type WeeklyPoint = {
   label: string;
   mood: number | null;
   score: number | null;
+  hasMedication: boolean;
 };
 
 type ChildEntry = {
   id: string;
   uid: string;
+  authorLabel: string;
   date: string;
   childName: string;
   situation: string;
@@ -108,6 +165,45 @@ type ChildPoint = {
   label: string;
   progress: number | null;
   score: number | null;
+};
+type HealthSettings = {
+  enabled: boolean;
+  medicationEnabled: boolean;
+  consented: boolean;
+};
+type ExpertRequest = {
+  id: string;
+  uid: string;
+  guestSessionId?: string | null;
+  authorLabel: string;
+  category: string;
+  requestText: string;
+  status: "open" | "answered";
+  advisorReply: string;
+  advisorLabel: string;
+  createdAt?: unknown;
+  repliedAt?: unknown;
+};
+type FortuneTone = "energy" | "focus" | "relationship" | "confidence";
+type FortuneTemplate = {
+  id: string;
+  tone: FortuneTone;
+  fortune: string;
+  mission: string;
+  prompt: string;
+  keywords: string[];
+};
+type ModeGuideField = {
+  key: string;
+  label: string;
+  placeholder: string;
+};
+type DiaryModeGuide = {
+  title: string;
+  description: string;
+  steps: string[];
+  fields: ModeGuideField[];
+  freePlaceholder: string;
 };
 
 const tracks: Track[] = [
@@ -335,20 +431,308 @@ const techniques: Technique[] = [
     title: "행동주의",
     description: "관찰 가능한 행동과 강화 계획을 통해 변화를 설계합니다.",
   },
+  {
+    id: "blended",
+    title: "일반 AI 대화",
+    description: "특정 상담기법 없이 평소 AI와 대화하듯 자유롭게 이야기합니다.",
+  },
 ];
 
+const emotionOptions = [
+  "기쁨",
+  "감사",
+  "평온",
+  "불안",
+  "우울",
+  "분노",
+  "피곤",
+  "외로움",
+  "답답함",
+  "희망",
+];
+
+const diaryModes: Array<{ id: DiaryModeId; title: string; description: string }> = [
+  {
+    id: "general",
+    title: "일반 일기 모드",
+    description: "자유롭게 하루를 기록합니다.",
+  },
+  {
+    id: "abc",
+    title: "인지 재구성 모드",
+    description: "사건(Activating) - 생각(Belief) - 결과(Consequence) 흐름으로 정리합니다.",
+  },
+  {
+    id: "guided",
+    title: "감정 정리 모드",
+    description: "보조 질문을 중심으로 감정을 구조화합니다.",
+  },
+  {
+    id: "reflection",
+    title: "자기 성찰 모드",
+    description: "의미, 배움, 다음 행동에 집중합니다.",
+  },
+];
+
+const childHighlightWords = [
+  "거부",
+  "공격",
+  "폭발",
+  "울음",
+  "불안",
+  "충돌",
+  "짜증",
+  "대화",
+  "규칙",
+  "수면",
+  "학교",
+  "숙제",
+  "친구",
+  "개선",
+  "악화",
+];
+
+const developerEmails = (process.env.NEXT_PUBLIC_DEVELOPER_EMAILS ?? "")
+  .split(",")
+  .map((email) => email.trim().toLowerCase())
+  .filter(Boolean);
+
+const DEFAULT_ASSISTANT_MESSAGE =
+  "종합 상담에 오신 것을 환영합니다. 먼저 카테고리를 고르고 고민과 상황을 적어주세요.";
+const REFLECTION_PROMPT_DAILY_LIMIT = 3;
+const reflectionPromptThemes = [
+  "오늘 가장 기억에 남는 순간",
+  "오늘 나를 지치게 한 장면",
+  "오늘 마음이 편해졌던 시간",
+  "오늘 가장 고마웠던 일",
+  "오늘 후회가 남는 선택",
+  "오늘 다시 하고 싶은 대화",
+  "오늘 가장 자랑스러웠던 행동",
+  "오늘 미뤄둔 일",
+  "오늘 감정이 크게 흔들린 이유",
+  "오늘 몸의 신호가 강했던 순간",
+  "오늘 관계에서 어려웠던 지점",
+  "오늘 관계에서 좋았던 지점",
+  "오늘 내가 나를 돌본 방식",
+  "오늘 집중이 잘 되었던 조건",
+  "오늘 집중을 방해한 요소",
+  "오늘 에너지가 올라간 계기",
+  "오늘 에너지가 떨어진 계기",
+  "오늘 불안을 키운 생각",
+  "오늘 안정을 준 생각",
+  "오늘 배운 가장 중요한 한 가지",
+  "오늘 놓치고 싶지 않은 깨달음",
+  "오늘 내가 붙잡고 있는 걱정",
+  "오늘 작지만 의미 있었던 성취",
+  "오늘 내일로 넘기고 싶은 일",
+  "오늘 내일에 꼭 이어가고 싶은 습관",
+];
+const reflectionPromptPool: string[] = reflectionPromptThemes.flatMap((theme) => [
+  `${theme}은(는) 언제였나요?`,
+  `${theme}가 생긴 직접적인 계기는 무엇이었나요?`,
+  `${theme}에서 내가 배운 점은 무엇이었나요?`,
+  `내일 ${theme}를 위해 바꾸고 싶은 한 가지는 무엇인가요?`,
+]);
+const fortuneTemplates: FortuneTemplate[] = [
+  {
+    id: "energy-reset",
+    tone: "energy",
+    fortune: "오늘은 예상보다 쉽게 지칠 수 있어요. 속도를 잠깐 늦추면 흐름이 다시 살아납니다.",
+    mission: "에너지가 떨어진 순간 1개와 회복에 도움 된 행동 1개를 기록해보세요.",
+    prompt: "오늘 내가 지친 순간은 언제였고, 어떻게 회복했나요?",
+    keywords: ["지침", "피곤", "휴식", "회복", "호흡"],
+  },
+  {
+    id: "focus-window",
+    tone: "focus",
+    fortune: "집중력이 짧게 끊길 수 있지만, 핵심 한 가지를 잡으면 성취감이 커지는 날입니다.",
+    mission: "오늘 가장 중요한 한 가지에 집중한 경험을 적어보세요.",
+    prompt: "오늘 내가 가장 집중했던 한 가지는 무엇이었나요?",
+    keywords: ["집중", "몰입", "핵심", "정리", "완료"],
+  },
+  {
+    id: "relationship-soft",
+    tone: "relationship",
+    fortune: "사소한 말투가 크게 느껴질 수 있어요. 한 번 더 부드럽게 말하면 관계가 풀립니다.",
+    mission: "대화에서 감정이 흔들린 순간과 조정한 표현을 적어보세요.",
+    prompt: "오늘 대화에서 내가 바꿔 말해본 표현이 있었나요?",
+    keywords: ["대화", "관계", "표현", "말투", "이해"],
+  },
+  {
+    id: "confidence-step",
+    tone: "confidence",
+    fortune: "작은 선택 하나가 자신감을 키우는 날입니다. 완벽보다 실행이 더 중요해요.",
+    mission: "완벽하지 않아도 실행한 행동 1개를 기록해보세요.",
+    prompt: "오늘 완벽하지 않아도 해낸 행동은 무엇이었나요?",
+    keywords: ["실행", "도전", "시도", "용기", "자신감"],
+  },
+  {
+    id: "energy-balance",
+    tone: "energy",
+    fortune: "무리하면 후반에 급격히 지칠 수 있어요. 중간 휴식이 오히려 결과를 좋게 만듭니다.",
+    mission: "중간 휴식 또는 템포 조절 경험을 한 줄로 남겨보세요.",
+    prompt: "오늘 속도를 조절한 순간이 있었나요?",
+    keywords: ["속도", "휴식", "템포", "조절", "회복"],
+  },
+  {
+    id: "focus-clean",
+    tone: "focus",
+    fortune: "잡생각이 늘 수 있지만, 우선순위를 정리하면 하루가 다시 명확해집니다.",
+    mission: "우선순위를 다시 정한 계기와 효과를 기록해보세요.",
+    prompt: "오늘 우선순위를 다시 정한 순간은 언제였나요?",
+    keywords: ["우선순위", "정리", "집중", "계획", "선택"],
+  },
+  {
+    id: "relationship-repair",
+    tone: "relationship",
+    fortune: "오해가 생겨도 회복 가능한 날이에요. 짧은 확인 질문이 관계를 살립니다.",
+    mission: "오해를 줄이기 위해 던진 질문 또는 확인 문장을 적어보세요.",
+    prompt: "오늘 내가 확인했던 질문은 무엇이었나요?",
+    keywords: ["오해", "확인", "질문", "관계", "회복"],
+  },
+  {
+    id: "confidence-ground",
+    tone: "confidence",
+    fortune: "스스로를 의심하기 쉬운 날이지만, 이미 해낸 경험을 떠올리면 흔들림이 줄어듭니다.",
+    mission: "오늘 나를 지탱한 과거의 성공 경험을 한 줄로 적어보세요.",
+    prompt: "오늘 나를 지탱해준 경험은 무엇이었나요?",
+    keywords: ["성공", "기억", "근거", "자신감", "안정"],
+  },
+];
+const diaryModeGuides: Record<DiaryModeId, DiaryModeGuide> = {
+  general: {
+    title: "일반 일기 가이드",
+    description: "오늘의 흐름을 편하게 기록하되, 감정-사건-배움을 한 번씩 짚어보세요.",
+    steps: ["오늘 있었던 일 1~2개", "그때 감정", "마무리 소감"],
+    fields: [
+      { key: "highlight", label: "오늘의 하이라이트", placeholder: "오늘 가장 기억에 남는 장면은?" },
+      { key: "hardest", label: "힘들었던 순간", placeholder: "어떤 점이 가장 어려웠나요?" },
+      { key: "support", label: "도움이 된 요소", placeholder: "누가/무엇이 도움이 되었나요?" },
+    ],
+    freePlaceholder: "오늘 하루를 자유롭게 기록해보세요.",
+  },
+  abc: {
+    title: "인지 재구성 가이드 (ABC)",
+    description: "사건-생각-결과를 분리해서 쓰면 감정에 휘둘리는 패턴을 더 쉽게 잡을 수 있어요.",
+    steps: ["A 사건", "B 자동 생각", "C 감정/행동 결과", "대안 생각", "다음 행동"],
+    fields: [
+      { key: "a_event", label: "A. 사건", placeholder: "무슨 일이 있었나요?" },
+      { key: "b_belief", label: "B. 자동 생각", placeholder: "그때 바로 든 생각은?" },
+      { key: "c_consequence", label: "C. 감정/행동", placeholder: "감정과 행동은 어땠나요?" },
+      { key: "d_dispute", label: "대안 생각", placeholder: "더 현실적인 생각으로 바꿔본다면?" },
+      { key: "e_effect", label: "다음 행동", placeholder: "내일 시도할 행동 1가지는?" },
+    ],
+    freePlaceholder: "추가로 적고 싶은 ABC 맥락이 있으면 자유롭게 적어주세요.",
+  },
+  guided: {
+    title: "감정 정리 가이드",
+    description: "감정의 원인과 몸의 반응, 필요한 도움을 분리해서 쓰면 정리가 빨라집니다.",
+    steps: ["상황", "감정 이름", "몸 반응", "필요한 것", "실행"],
+    fields: [
+      { key: "situation", label: "상황", placeholder: "감정이 크게 올라온 상황은?" },
+      { key: "emotion_name", label: "감정 이름", placeholder: "가장 강했던 감정 1~2개는?" },
+      { key: "body_signal", label: "몸의 신호", placeholder: "몸에서는 어떤 반응이 있었나요?" },
+      { key: "need", label: "필요", placeholder: "지금 나에게 필요한 것은?" },
+      { key: "action", label: "실행", placeholder: "오늘 바로 할 수 있는 작은 행동은?" },
+    ],
+    freePlaceholder: "감정 정리 후 남은 생각을 자유롭게 적어주세요.",
+  },
+  reflection: {
+    title: "자기 성찰 가이드",
+    description: "하루를 평가보다 관찰 관점으로 적으면 자기비난을 줄이고 개선점을 찾기 쉬워집니다.",
+    steps: ["감사", "잘한 점", "배운 점", "내일의 한 가지"],
+    fields: [
+      { key: "gratitude", label: "감사한 점", placeholder: "오늘 고마웠던 것은?" },
+      { key: "strength", label: "잘한 점", placeholder: "오늘 내가 잘한 행동은?" },
+      { key: "lesson", label: "배운 점", placeholder: "오늘 배운 점은?" },
+      { key: "tomorrow", label: "내일의 한 가지", placeholder: "내일 실행할 1가지는?" },
+      { key: "self_word", label: "나에게 건네는 말", placeholder: "오늘의 나에게 한 문장" },
+    ],
+    freePlaceholder: "성찰 내용을 더 자유롭게 이어서 적어보세요.",
+  },
+};
+
 function todayInputValue() {
-  return new Date().toISOString().slice(0, 10);
+  return dateInputValue(new Date());
+}
+
+function pad2(value: number) {
+  return String(value).padStart(2, "0");
+}
+
+function dateInputValue(date: Date) {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+}
+
+function addDays(base: Date, offset: number) {
+  const next = new Date(base);
+  next.setDate(next.getDate() + offset);
+  return next;
+}
+
+function reflectionPromptUsageKey(date: string) {
+  return `reflection_prompt_count:${date}`;
+}
+function guestHealthSettingsKey(sessionId: string) {
+  return `guest_health_settings:${sessionId}`;
+}
+
+function getReflectionPromptUsage(date: string) {
+  if (typeof window === "undefined") return 0;
+  const value = window.localStorage.getItem(reflectionPromptUsageKey(date));
+  const parsed = Number(value ?? "0");
+  if (!Number.isFinite(parsed) || parsed < 0) return 0;
+  return Math.floor(parsed);
+}
+
+function setReflectionPromptUsage(date: string, count: number) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(reflectionPromptUsageKey(date), String(Math.max(0, Math.floor(count))));
+}
+
+function hashText(value: string) {
+  let hash = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    hash = (hash * 31 + value.charCodeAt(i)) >>> 0;
+  }
+  return hash;
+}
+
+function pickDailyFortune(date: string, userSeed: string) {
+  const seed = `${date}:${userSeed || "guest"}`;
+  const idx = hashText(seed) % fortuneTemplates.length;
+  return fortuneTemplates[idx];
+}
+
+function composeDiaryContent(
+  mode: DiaryModeId,
+  answers: Record<string, string>,
+  freeText: string
+) {
+  const guide = diaryModeGuides[mode];
+  const sections = guide.fields
+    .map((field) => {
+      const value = (answers[field.key] ?? "").trim();
+      if (!value) return "";
+      return `${field.label}: ${value}`;
+    })
+    .filter(Boolean);
+  const extra = freeText.trim();
+
+  if (mode === "general") {
+    const focused = sections.length > 0 ? sections.join("\n") : "";
+    if (focused && extra) return `${focused}\n\n자유 메모: ${extra}`;
+    return focused || extra;
+  }
+
+  if (sections.length > 0 && extra) {
+    return `${sections.join("\n")}\n\n자유 메모: ${extra}`;
+  }
+  return sections.join("\n") || extra;
 }
 
 function scoreFromMood(mood: number) {
   return Math.round(((Math.max(1, Math.min(10, mood)) - 1) / 9) * 100);
-}
-
-function moodLabel(mood: number) {
-  if (mood >= 8) return "좋음";
-  if (mood >= 5) return "보통";
-  return "힘듦";
 }
 
 function trendLabel(delta: number) {
@@ -357,41 +741,163 @@ function trendLabel(delta: number) {
   return "유지";
 }
 
+function clampMood(value: number) {
+  return Math.max(1, Math.min(10, value));
+}
+
+function averageMood(values: number[]) {
+  if (values.length === 0) return 5;
+  return Math.round(values.reduce((sum, value) => sum + clampMood(value), 0) / values.length);
+}
+
+function emotionSummaryText(emotions: string[], mood: number, energy: number) {
+  if (emotions.length === 0) {
+    return "감정을 선택하면 오늘 정서 요약이 여기에 표시됩니다.";
+  }
+  const negative = emotions.filter((emotion) =>
+    ["불안", "우울", "분노", "피곤", "외로움", "답답함"].includes(emotion)
+  );
+  const positive = emotions.filter((emotion) => ["기쁨", "감사", "평온", "희망"].includes(emotion));
+  const center =
+    negative.length >= positive.length
+      ? `${negative.slice(0, 2).join(" + ")} 중심`
+      : `${positive.slice(0, 2).join(" + ")} 중심`;
+  const tone =
+    negative.length > positive.length
+      ? "기쁨 대비 스트레스가 높습니다."
+      : positive.length > negative.length
+      ? "회복 자원이 살아 있습니다."
+      : "감정 강도가 비슷하게 섞여 있습니다.";
+  const energyNote = energy <= 4 ? "에너지가 낮아 휴식 우선이 좋아요." : "";
+  const moodNote = mood <= 4 ? "불편한 감정은 짧게라도 기록해 두세요." : "";
+  return `오늘은 ${center}. ${tone} ${energyNote} ${moodNote}`.trim();
+}
+
+function extractKeySentence(reflection: string) {
+  const cleaned = reflection.replace(/\s+/g, " ").trim();
+  if (!cleaned) return "";
+  const chunks = cleaned
+    .split(/(?<=[.!?。！？])\s+/)
+    .map((chunk) => chunk.trim())
+    .filter(Boolean);
+  if (chunks.length === 0) return cleaned.slice(0, 60);
+  return chunks.reduce((best, current) => (current.length > best.length ? current : best), chunks[0]);
+}
+
+function lineYFromMood(mood: number | null, height: number) {
+  if (mood === null) return null;
+  const ratio = (clampMood(mood) - 1) / 9;
+  return Math.round(height - ratio * height);
+}
+
+function moodHeatTone(value: number | null) {
+  if (value === null) return "none";
+  if (value >= 7) return "good";
+  if (value >= 4) return "mid";
+  return "low";
+}
+
+function makeAuthorKey(uid: string, authorLabel: string) {
+  const normalizedUid = uid.trim();
+  if (normalizedUid) return normalizedUid;
+  const normalizedLabel = authorLabel.trim();
+  return normalizedLabel || "(알 수 없음)";
+}
+
+function groupByDateDesc<T extends { date: string }>(rows: T[]) {
+  const grouped = new Map<string, T[]>();
+  for (const row of rows) {
+    const bucket = grouped.get(row.date) ?? [];
+    bucket.push(row);
+    grouped.set(row.date, bucket);
+  }
+  return [...grouped.entries()]
+    .sort(([a], [b]) => b.localeCompare(a))
+    .map(([date, items]) => ({ date, items }));
+}
+
+function normalizeAccountId(value: string) {
+  return value.trim().toLowerCase();
+}
+
+function toAuthEmail(accountId: string) {
+  return `${normalizeAccountId(accountId)}@users.ai-counsel.local`;
+}
+
+function authErrorMessage(
+  error: unknown,
+  action: "google" | "guest" | "login" | "signup"
+) {
+  const code =
+    typeof error === "object" && error && "code" in error
+      ? String((error as { code?: unknown }).code ?? "")
+      : "";
+
+  if (code === "auth/operation-not-allowed") {
+    if (action === "guest") {
+      return "Firebase 설정: Anonymous(익명) 로그인이 꺼져 있습니다. Firebase Console > Authentication > Sign-in method에서 Anonymous를 활성화해 주세요.";
+    }
+    if (action === "google") {
+      return "Firebase 설정: Google 로그인이 꺼져 있습니다. Firebase Console > Authentication > Sign-in method에서 Google을 활성화해 주세요.";
+    }
+    return "Firebase 설정: Email/Password 로그인이 꺼져 있습니다. Firebase Console > Authentication > Sign-in method에서 Email/Password를 활성화해 주세요.";
+  }
+
+  if (code === "auth/invalid-credential" || code === "auth/user-not-found") {
+    return "아이디 또는 비밀번호가 올바르지 않습니다.";
+  }
+  if (code === "auth/wrong-password") {
+    return "비밀번호가 올바르지 않습니다.";
+  }
+  if (code === "auth/email-already-in-use") {
+    return "이미 사용 중인 아이디입니다.";
+  }
+  if (code === "auth/weak-password") {
+    return "비밀번호가 너무 약합니다. 6자 이상으로 입력해 주세요.";
+  }
+
+  return error instanceof Error ? error.message : "인증 중 오류가 발생했습니다.";
+}
+
 const googleProvider = new GoogleAuthProvider();
 
 export default function Page() {
   const [activeTab, setActiveTab] = useState<TabId>("counsel");
   const [uid, setUid] = useState<string | null>(null);
+  const [guestSessionId, setGuestSessionId] = useState<string | null>(null);
+  const [authEmail, setAuthEmail] = useState("");
   const [userEmail, setUserEmail] = useState("");
   const [isGuestUser, setIsGuestUser] = useState(false);
   const [authLoading, setAuthLoading] = useState(true);
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [authMessage, setAuthMessage] = useState("");
-  const [email, setEmail] = useState("");
+  const [accountId, setAccountId] = useState("");
+  const [nickname, setNickname] = useState("");
+  const [contact, setContact] = useState("");
   const [password, setPassword] = useState("");
+  const [signupMode, setSignupMode] = useState(false);
+  const [signupConsentAdminView, setSignupConsentAdminView] = useState(false);
 
   const [selectedTrack, setSelectedTrack] = useState<TrackId>("career");
   const [messages, setMessages] = useState<Msg[]>([
     {
       role: "assistant",
-      text: "종합 상담에 오신 것을 환영합니다. 먼저 카테고리를 고르고 고민과 상황을 적어주세요.",
+      text: DEFAULT_ASSISTANT_MESSAGE,
     },
   ]);
+  const [chatThreads, setChatThreads] = useState<ChatThread[]>([]);
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [input, setInput] = useState("");
-  const [selectedTechnique, setSelectedTechnique] = useState<TechniqueId>("rebt");
+  const [selectedTechnique, setSelectedTechnique] = useState<TechniqueId>("blended");
   const [intake, setIntake] = useState<IntakeForm>({
     age: "",
     currentSituation: "",
     periodFrequency: "",
     hardestPoint: "",
-    helpStyle: "",
   });
   const [intakeCompleted, setIntakeCompleted] = useState(false);
   const [intakeError, setIntakeError] = useState("");
   const [loading, setLoading] = useState(false);
-  const [chatId] = useState(() => crypto.randomUUID());
-  const [expertIntent, setExpertIntent] = useState<"idle" | "asked" | "requested" | "paid">("idle");
-  const [expertStatus, setExpertStatus] = useState("");
 
   const [activeTestId, setActiveTestId] = useState<TestId | null>(null);
   const [answers, setAnswers] = useState<Record<number, number>>({});
@@ -403,15 +909,53 @@ export default function Page() {
   const [testModalOpen, setTestModalOpen] = useState(false);
   const [sctAnalyzing, setSctAnalyzing] = useState(false);
   const [sctTechnique, setSctTechnique] = useState<TechniqueId>("rebt");
-  const [expertReportFromTest, setExpertReportFromTest] = useState("");
 
-  const [journalText, setJournalText] = useState("");
   const [journalDate, setJournalDate] = useState(todayInputValue());
   const [mood, setMood] = useState(5);
+  const [energy, setEnergy] = useState(5);
+  const [relationship, setRelationship] = useState(5);
+  const [achievement, setAchievement] = useState(5);
+  const [emotions, setEmotions] = useState<string[]>([]);
+  const [reflection, setReflection] = useState("");
+  const [healthSettings, setHealthSettings] = useState<HealthSettings>({
+    enabled: false,
+    medicationEnabled: false,
+    consented: false,
+  });
+  const [healthSettingsOpen, setHealthSettingsOpen] = useState(false);
+  const [healthSectionOpen, setHealthSectionOpen] = useState(false);
+  const [medicationStatus, setMedicationStatus] = useState<"" | "taken" | "partial" | "skipped">("");
+  const [medicationTimes, setMedicationTimes] = useState<string[]>([]);
+  const [medicationName, setMedicationName] = useState("");
+  const [medicationCategory, setMedicationCategory] = useState("");
+  const [medicationMemo, setMedicationMemo] = useState("");
+  const [medicationMissedReason, setMedicationMissedReason] = useState("");
+  const [modeAnswers, setModeAnswers] = useState<Record<DiaryModeId, Record<string, string>>>({
+    general: {},
+    abc: {},
+    guided: {},
+    reflection: {},
+  });
+  const [diaryMode, setDiaryMode] = useState<DiaryModeId>("general");
+  const [liveCommentEnabled, setLiveCommentEnabled] = useState(false);
+  const [fortuneMissionDone, setFortuneMissionDone] = useState(false);
+  const [reflectionPromptCount, setReflectionPromptCount] = useState(0);
+  const [reflectionPromptMessage, setReflectionPromptMessage] = useState("");
   const [saveStatus, setSaveStatus] = useState("");
   const [journalList, setJournalList] = useState<JournalEntry[]>([]);
+  const [editingJournalId, setEditingJournalId] = useState<string | null>(null);
   const [weeklyAiSummary, setWeeklyAiSummary] = useState("");
+  const [diaryAnalysisRange, setDiaryAnalysisRange] = useState<"weekly" | "monthly" | "custom">("weekly");
+  const [diaryAnalysisStartDate, setDiaryAnalysisStartDate] = useState(
+    dateInputValue(addDays(new Date(), -6))
+  );
+  const [diaryAnalysisEndDate, setDiaryAnalysisEndDate] = useState(todayInputValue());
+  const [analysisPanelOpen, setAnalysisPanelOpen] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
+  const [selectedTechniqueForAnalysis, setSelectedTechniqueForAnalysis] = useState<TechniqueId>("blended");
+  const [diaryAnalysisMonth, setDiaryAnalysisMonth] = useState(new Date());
+  const [childAnalysisMonth, setChildAnalysisMonth] = useState(new Date());
+  const [diaryDayListOpen, setDiaryDayListOpen] = useState(true);
 
   const [childDate, setChildDate] = useState(todayInputValue());
   const [childName, setChildName] = useState("");
@@ -420,9 +964,21 @@ export default function Page() {
   const [childOutcome, setChildOutcome] = useState("");
   const [childProgress, setChildProgress] = useState(5);
   const [childAiSolution, setChildAiSolution] = useState("");
+  const [childTechnique, setChildTechnique] = useState<TechniqueId>("blended");
   const [childSaveStatus, setChildSaveStatus] = useState("");
   const [childAnalyzing, setChildAnalyzing] = useState(false);
   const [childList, setChildList] = useState<ChildEntry[]>([]);
+  const [developerAuthorFilter, setDeveloperAuthorFilter] = useState("all");
+  const [editingChildId, setEditingChildId] = useState<string | null>(null);
+  const [adminUsers, setAdminUsers] = useState<UserProfile[]>([]);
+  const [deleteRequests, setDeleteRequests] = useState<DeleteRequest[]>([]);
+  const [expertRequests, setExpertRequests] = useState<ExpertRequest[]>([]);
+  const [expertCategory, setExpertCategory] = useState("일기 피드백");
+  const [expertRequestText, setExpertRequestText] = useState("");
+  const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({});
+  const [deleteReason, setDeleteReason] = useState("");
+  const [deletingUid, setDeletingUid] = useState<string | null>(null);
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
 
   const selectedTrackInfo = useMemo(
     () => tracks.find((track) => track.id === selectedTrack) ?? tracks[0],
@@ -434,18 +990,49 @@ export default function Page() {
     [activeTestId]
   );
   const currentTechnique = useMemo(
-    () => techniques.find((technique) => technique.id === selectedTechnique) ?? techniques[2],
+    () => techniques.find((technique) => technique.id === selectedTechnique) ?? techniques[0],
     [selectedTechnique]
+  );
+  const currentDiaryTechnique = useMemo(
+    () =>
+      techniques.find((technique) => technique.id === selectedTechniqueForAnalysis) ?? techniques[0],
+    [selectedTechniqueForAnalysis]
+  );
+  const currentDiaryMode = useMemo(
+    () => diaryModes.find((mode) => mode.id === diaryMode) ?? diaryModes[0],
+    [diaryMode]
+  );
+  const currentModeGuide = useMemo(() => diaryModeGuides[diaryMode], [diaryMode]);
+  const currentModeAnswers = useMemo(() => modeAnswers[diaryMode] ?? {}, [diaryMode, modeAnswers]);
+  const modeFilledCount = useMemo(
+    () => currentModeGuide.fields.filter((field) => (currentModeAnswers[field.key] ?? "").trim()).length,
+    [currentModeAnswers, currentModeGuide.fields]
+  );
+  const composedDiaryText = useMemo(
+    () => composeDiaryContent(diaryMode, currentModeAnswers, reflection),
+    [currentModeAnswers, diaryMode, reflection]
+  );
+  const dailyFortune = useMemo(
+    () => pickDailyFortune(journalDate, uid ?? userEmail ?? guestSessionId ?? "guest"),
+    [guestSessionId, journalDate, uid, userEmail]
+  );
+  const currentChildTechnique = useMemo(
+    () => techniques.find((technique) => technique.id === childTechnique) ?? techniques[0],
+    [childTechnique]
   );
   const isIntakeValid = useMemo(() => {
     return (
       intake.age.trim() &&
       intake.currentSituation.trim() &&
       intake.periodFrequency.trim() &&
-      intake.hardestPoint.trim() &&
-      intake.helpStyle.trim()
+      intake.hardestPoint.trim()
     );
   }, [intake]);
+  const isDeveloper = useMemo(() => {
+    if (isGuestUser) return false;
+    const normalized = authEmail.trim().toLowerCase();
+    return normalized !== "" && developerEmails.includes(normalized);
+  }, [authEmail, isGuestUser]);
 
   const riasecDetailMap: Record<string, string> = {
     R: "현실형(R): 도구/장비/현장 문제 해결에 강하고, 실행 중심 환경에서 성과가 좋습니다.",
@@ -478,13 +1065,59 @@ export default function Page() {
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (user) => {
       if (user) {
+        setChatThreads([]);
+        setActiveChatId(null);
+        setMessages([{ role: "assistant", text: DEFAULT_ASSISTANT_MESSAGE }]);
+        setJournalList([]);
+        setChildList([]);
         setUid(user.uid);
         setIsGuestUser(user.isAnonymous);
-        setUserEmail(user.email ?? "게스트 사용자");
+        setAuthEmail(user.email ?? "");
+        if (user.isAnonymous) {
+          setUserEmail("게스트 사용자");
+        } else {
+          void (async () => {
+            try {
+              const profileSnap = await getDoc(doc(db, "users", user.uid));
+              if (profileSnap.exists()) {
+                const data = profileSnap.data();
+                const profileName = String(data.nickname ?? "").trim();
+                const profileId = String(data.accountId ?? "").trim();
+                setUserEmail(
+                  profileName && profileId
+                    ? `${profileName} (${profileId})`
+                    : profileName || profileId || user.email || user.uid
+                );
+                return;
+              }
+              setUserEmail(user.email ?? user.uid);
+            } catch {
+              setUserEmail(user.email ?? user.uid);
+            }
+          })();
+        }
+        if (user.isAnonymous) {
+          const existingSession = sessionStorage.getItem("guest_session_id");
+          if (existingSession) {
+            setGuestSessionId(existingSession);
+          } else {
+            const nextSession = crypto.randomUUID();
+            sessionStorage.setItem("guest_session_id", nextSession);
+            setGuestSessionId(nextSession);
+          }
+        } else {
+          sessionStorage.removeItem("guest_session_id");
+          setGuestSessionId(null);
+        }
       } else {
         setUid(null);
+        setGuestSessionId(null);
+        setAuthEmail("");
         setUserEmail("");
         setIsGuestUser(false);
+        setChatThreads([]);
+        setActiveChatId(null);
+        setMessages([{ role: "assistant", text: DEFAULT_ASSISTANT_MESSAGE }]);
         setJournalList([]);
         setChildList([]);
       }
@@ -496,13 +1129,23 @@ export default function Page() {
 
   useEffect(() => {
     if (!uid) return;
+    if (isGuestUser && !guestSessionId) return;
 
-    const q = query(
-      collection(db, "journals"),
-      where("uid", "==", uid),
-      orderBy("date", "desc"),
-      limit(120)
-    );
+    const q = isDeveloper
+      ? query(collection(db, "journals"), orderBy("date", "desc"), limit(2000))
+      : isGuestUser
+      ? query(
+          collection(db, "journals"),
+          where("guestSessionId", "==", guestSessionId),
+          orderBy("date", "desc"),
+          limit(1000)
+        )
+      : query(
+          collection(db, "journals"),
+          where("uid", "==", uid),
+          orderBy("date", "desc"),
+          limit(1000)
+        );
 
     const unsub = onSnapshot(q, (snapshot) => {
       const rows: JournalEntry[] = snapshot.docs.map((journalDoc) => {
@@ -510,9 +1153,47 @@ export default function Page() {
         return {
           id: journalDoc.id,
           uid: String(data.uid ?? ""),
+          authorLabel: String(data.authorLabel ?? data.userEmail ?? data.uid ?? ""),
           date: String(data.date ?? ""),
+          mode: String(data.mode ?? "general") as DiaryModeId,
+          fortuneId: String(data.fortuneId ?? ""),
+          fortuneText: String(data.fortuneText ?? ""),
+          missionText: String(data.missionText ?? ""),
+          missionCompleted: Boolean(data.missionCompleted ?? false),
+          medicationRecord:
+            typeof data.medicationRecord === "object" && data.medicationRecord
+              ? {
+                  status:
+                    data.medicationRecord.status === "partial" || data.medicationRecord.status === "skipped"
+                      ? data.medicationRecord.status
+                      : "taken",
+                  times: Array.isArray(data.medicationRecord.times)
+                    ? data.medicationRecord.times.map((item: unknown) => String(item))
+                    : [],
+                  name: String(data.medicationRecord.name ?? ""),
+                  category: String(data.medicationRecord.category ?? ""),
+                  note: String(data.medicationRecord.note ?? ""),
+                  missedReason: String(data.medicationRecord.missedReason ?? ""),
+                }
+              : Array.isArray(data.medicationChecks) && data.medicationChecks.length > 0
+              ? {
+                  status: "taken",
+                  times: [],
+                  name: "",
+                  category: "기타",
+                  note: data.medicationChecks.map((item: unknown) => String(item)).join(", "),
+                  missedReason: "",
+                }
+              : null,
           mood: Number(data.mood ?? 5),
-          text: String(data.text ?? ""),
+          energy: Number(data.energy ?? 5),
+          relationship: Number(data.relationship ?? 5),
+          achievement: Number(data.achievement ?? 5),
+          emotions: Array.isArray(data.emotions)
+            ? data.emotions.map((emotion: unknown) => String(emotion))
+            : [],
+          reflection: String(data.reflection ?? data.text ?? ""),
+          text: String(data.text ?? data.reflection ?? ""),
           createdAt: data.createdAt,
         };
       });
@@ -520,17 +1201,230 @@ export default function Page() {
     });
 
     return () => unsub();
-  }, [uid]);
+  }, [guestSessionId, isDeveloper, isGuestUser, uid]);
+
+  useEffect(() => {
+    if (!uid) {
+      setHealthSettings({ enabled: false, medicationEnabled: false, consented: false });
+      return;
+    }
+    if (isGuestUser) {
+      if (!guestSessionId) return;
+      try {
+        const raw = window.localStorage.getItem(guestHealthSettingsKey(guestSessionId));
+        if (!raw) {
+          setHealthSettings({ enabled: false, medicationEnabled: false, consented: false });
+          return;
+        }
+        const parsed = JSON.parse(raw);
+        if (typeof parsed !== "object" || !parsed) {
+          setHealthSettings({ enabled: false, medicationEnabled: false, consented: false });
+          return;
+        }
+        setHealthSettings({
+          enabled: Boolean((parsed as { enabled?: unknown }).enabled),
+          medicationEnabled: Boolean((parsed as { medicationEnabled?: unknown }).medicationEnabled),
+          consented: Boolean((parsed as { consented?: unknown }).consented),
+        });
+      } catch {
+        setHealthSettings({ enabled: false, medicationEnabled: false, consented: false });
+      }
+      return;
+    }
+
+    const unsub = onSnapshot(doc(db, "diary-settings", uid), (snapshot) => {
+      const data = snapshot.data();
+      setHealthSettings({
+        enabled: Boolean(data?.healthTrackingEnabled ?? false),
+        medicationEnabled: Boolean(data?.medicationTrackingEnabled ?? false),
+        consented: Boolean(data?.healthConsent ?? false),
+      });
+    });
+    return () => unsub();
+  }, [guestSessionId, isGuestUser, uid]);
+
+  useEffect(() => {
+    if (!uid || !isDeveloper) {
+      setAdminUsers([]);
+      setDeleteRequests([]);
+      return;
+    }
+
+    const usersQ = query(
+      collection(db, "users"),
+      where("consentAdminView", "==", true),
+      limit(500)
+    );
+    const reqQ = query(collection(db, "account-delete-requests"), limit(500));
+
+    const unsubUsers = onSnapshot(usersQ, (snapshot) => {
+      const rows: UserProfile[] = snapshot.docs.map((profileDoc) => {
+        const data = profileDoc.data();
+        return {
+          uid: String(data.uid ?? profileDoc.id),
+          nickname: String(data.nickname ?? ""),
+          accountId: String(data.accountId ?? ""),
+          contact: String(data.contact ?? ""),
+          consentAdminView: Boolean(data.consentAdminView ?? false),
+          disabled: Boolean(data.disabled ?? false),
+          createdAt: data.createdAt,
+        };
+      });
+      setAdminUsers(rows.sort((a, b) => a.accountId.localeCompare(b.accountId)));
+    });
+
+    const unsubReq = onSnapshot(reqQ, (snapshot) => {
+      const rows: DeleteRequest[] = snapshot.docs.map((reqDoc) => {
+        const data = reqDoc.data();
+        return {
+          uid: String(data.uid ?? reqDoc.id),
+          accountId: String(data.accountId ?? ""),
+          nickname: String(data.nickname ?? ""),
+          reason: String(data.reason ?? ""),
+          status: data.status === "processed" ? "processed" : "pending",
+          requestedAt: data.requestedAt,
+          processedAt: data.processedAt,
+        };
+      });
+      setDeleteRequests(rows.sort((a, b) => (a.status > b.status ? -1 : 1)));
+    });
+
+    return () => {
+      unsubUsers();
+      unsubReq();
+    };
+  }, [isDeveloper, uid]);
+
+  useEffect(() => {
+    if (!uid) {
+      setExpertRequests([]);
+      return;
+    }
+    if (isGuestUser && !guestSessionId) return;
+
+    const q = isDeveloper
+      ? query(collection(db, "expert-requests"), orderBy("createdAt", "desc"), limit(500))
+      : isGuestUser
+      ? query(
+          collection(db, "expert-requests"),
+          where("guestSessionId", "==", guestSessionId),
+          orderBy("createdAt", "desc"),
+          limit(200)
+        )
+      : query(
+          collection(db, "expert-requests"),
+          where("uid", "==", uid),
+          orderBy("createdAt", "desc"),
+          limit(200)
+        );
+
+    const unsub = onSnapshot(q, (snapshot) => {
+      const rows: ExpertRequest[] = snapshot.docs.map((requestDoc) => {
+        const data = requestDoc.data();
+        return {
+          id: requestDoc.id,
+          uid: String(data.uid ?? ""),
+          guestSessionId: data.guestSessionId ? String(data.guestSessionId) : null,
+          authorLabel: String(data.authorLabel ?? data.userEmail ?? data.uid ?? ""),
+          category: String(data.category ?? "일기 피드백"),
+          requestText: String(data.requestText ?? ""),
+          status: data.status === "answered" ? "answered" : "open",
+          advisorReply: String(data.advisorReply ?? ""),
+          advisorLabel: String(data.advisorLabel ?? ""),
+          createdAt: data.createdAt,
+          repliedAt: data.repliedAt,
+        };
+      });
+      setExpertRequests(rows);
+    });
+
+    return () => unsub();
+  }, [guestSessionId, isDeveloper, isGuestUser, uid]);
 
   useEffect(() => {
     if (!uid) return;
+    if (isGuestUser) {
+      setChatThreads([]);
+      setActiveChatId(null);
+      setMessages([{ role: "assistant", text: DEFAULT_ASSISTANT_MESSAGE }]);
+      return;
+    }
 
     const q = query(
-      collection(db, "child-workspaces"),
+      collection(db, "chats"),
       where("uid", "==", uid),
-      orderBy("date", "desc"),
-      limit(120)
+      orderBy("lastMessageAt", "desc"),
+      limit(80)
     );
+
+    const unsub = onSnapshot(q, (snapshot) => {
+      const rows: ChatThread[] = snapshot.docs.map((chatDoc) => {
+        const data = chatDoc.data();
+        return {
+          id: chatDoc.id,
+          title: String(data.title ?? "새 상담"),
+          createdAt: data.createdAt,
+          lastMessageAt: data.lastMessageAt,
+        };
+      });
+      setChatThreads(rows);
+      if (rows.length === 0) {
+        setActiveChatId(null);
+        setMessages([{ role: "assistant", text: DEFAULT_ASSISTANT_MESSAGE }]);
+        return;
+      }
+      setActiveChatId((prev) => prev ?? rows[0].id);
+    });
+
+    return () => unsub();
+  }, [isGuestUser, uid]);
+
+  useEffect(() => {
+    if (!activeChatId) {
+      setMessages([{ role: "assistant", text: DEFAULT_ASSISTANT_MESSAGE }]);
+      return;
+    }
+
+    const q = query(
+      collection(db, "chats", activeChatId, "messages"),
+      orderBy("createdAt", "asc"),
+      limit(400)
+    );
+    const unsub = onSnapshot(q, (snapshot) => {
+      const rows: Msg[] = snapshot.docs.map((messageDoc) => {
+        const data = messageDoc.data();
+        return {
+          role: data.role === "assistant" ? "assistant" : "user",
+          text: String(data.text ?? ""),
+        };
+      });
+      setMessages(
+        rows.length > 0 ? rows : [{ role: "assistant", text: DEFAULT_ASSISTANT_MESSAGE }]
+      );
+    });
+
+    return () => unsub();
+  }, [activeChatId]);
+
+  useEffect(() => {
+    if (!uid) return;
+    if (isGuestUser && !guestSessionId) return;
+
+    const q = isDeveloper
+      ? query(collection(db, "child-workspaces"), orderBy("date", "desc"), limit(2000))
+      : isGuestUser
+      ? query(
+          collection(db, "child-workspaces"),
+          where("guestSessionId", "==", guestSessionId),
+          orderBy("date", "desc"),
+          limit(1000)
+        )
+      : query(
+          collection(db, "child-workspaces"),
+          where("uid", "==", uid),
+          orderBy("date", "desc"),
+          limit(1000)
+        );
 
     const unsub = onSnapshot(q, (snapshot) => {
       const rows: ChildEntry[] = snapshot.docs.map((childDoc) => {
@@ -538,6 +1432,7 @@ export default function Page() {
         return {
           id: childDoc.id,
           uid: String(data.uid ?? ""),
+          authorLabel: String(data.authorLabel ?? data.userEmail ?? data.uid ?? ""),
           date: String(data.date ?? ""),
           childName: String(data.childName ?? ""),
           situation: String(data.situation ?? ""),
@@ -552,7 +1447,18 @@ export default function Page() {
     });
 
     return () => unsub();
-  }, [uid]);
+  }, [guestSessionId, isDeveloper, isGuestUser, uid]);
+
+  useEffect(() => {
+    setReflectionPromptCount(getReflectionPromptUsage(journalDate));
+    setReflectionPromptMessage("");
+  }, [journalDate]);
+
+  useEffect(() => {
+    if (!(healthSettings.enabled && healthSettings.medicationEnabled && healthSettings.consented)) {
+      setHealthSectionOpen(false);
+    }
+  }, [healthSettings]);
 
   const weeklyPoints = useMemo<WeeklyPoint[]>(() => {
     const byDate = new Map<string, JournalEntry>();
@@ -564,7 +1470,7 @@ export default function Page() {
     for (let i = 6; i >= 0; i -= 1) {
       const day = new Date();
       day.setDate(day.getDate() - i);
-      const key = day.toISOString().slice(0, 10);
+      const key = dateInputValue(day);
       const entry = byDate.get(key);
       const label = `${day.getMonth() + 1}/${day.getDate()}`;
       points.push({
@@ -572,6 +1478,7 @@ export default function Page() {
         label,
         mood: entry ? entry.mood : null,
         score: entry ? scoreFromMood(entry.mood) : null,
+        hasMedication: Boolean(entry?.medicationRecord),
       });
     }
 
@@ -608,38 +1515,366 @@ export default function Page() {
       trend: trendLabel(delta),
     };
   }, [weeklyPoints]);
-
-  const latestEntries = useMemo(() => journalList.slice(0, 20), [journalList]);
-  const latestChildEntries = useMemo(() => childList.slice(0, 20), [childList]);
-
-  const weeklyEntryText = useMemo(() => {
-    const weeklyDates = new Set(weeklyPoints.map((p) => p.date));
-    return journalList
-      .filter((entry) => weeklyDates.has(entry.date))
-      .map((entry) => `${entry.date} (기분 ${entry.mood}/10): ${entry.text}`)
-      .join("\n");
-  }, [journalList, weeklyPoints]);
-
-  const developerPayload = useMemo(() => {
+  const todayCompositeMood = useMemo(
+    () => averageMood([mood, energy, relationship, achievement]),
+    [achievement, energy, mood, relationship]
+  );
+  const todayCompositeScore = useMemo(() => scoreFromMood(todayCompositeMood), [todayCompositeMood]);
+  const emotionSummary = useMemo(
+    () => emotionSummaryText(emotions, mood, energy),
+    [emotions, energy, mood]
+  );
+  const reflectionLength = useMemo(() => composedDiaryText.trim().length, [composedDiaryText]);
+  const keySentence = useMemo(() => extractKeySentence(composedDiaryText), [composedDiaryText]);
+  const liveAiComment = useMemo(() => {
+    if (!liveCommentEnabled) return "";
+    if (todayCompositeMood >= 8) {
+      return "안정 자원이 충분해 보입니다. 내일 유지할 루틴 1개를 적어보세요.";
+    }
+    if (todayCompositeMood >= 5) {
+      return "균형 구간입니다. 감정 변동을 만든 사건 1가지만 더 적어보면 분석 정확도가 올라갑니다.";
+    }
+    return "부담 강도가 높아 보입니다. 오늘 가장 힘든 순간 1개와 그때 든 생각을 분리해 적어보세요.";
+  }, [liveCommentEnabled, todayCompositeMood]);
+  const emotionDonut = useMemo(() => {
+    const positive = emotions.filter((emotion) => ["기쁨", "감사", "평온", "희망"].includes(emotion)).length;
+    const neutral = emotions.filter((emotion) => ["피곤", "답답함"].includes(emotion)).length;
+    const negative = emotions.filter((emotion) => ["불안", "우울", "분노", "외로움"].includes(emotion)).length;
+    const total = positive + neutral + negative;
+    if (total === 0) {
+      return {
+        gradient: "conic-gradient(#f1dfd2 0deg 360deg)",
+        labels: [
+          { key: "긍정", value: 0, color: "#4e8d5d" },
+          { key: "중립", value: 0, color: "#ba814b" },
+          { key: "부담", value: 0, color: "#c45a4d" },
+        ],
+      };
+    }
+    const positiveDeg = Math.round((positive / total) * 360);
+    const neutralDeg = Math.round((neutral / total) * 360);
     return {
-      generatedAt: new Date().toISOString(),
-      uid,
-      entryCount: journalList.length,
-      weekly: {
-        averageScore: weeklyStats.average,
-        trend: weeklyStats.trend,
-        delta: weeklyStats.delta,
-        points: weeklyPoints,
-      },
-      entries: journalList.map((entry) => ({
-        id: entry.id,
-        date: entry.date,
-        mood: entry.mood,
-        moodLabel: moodLabel(entry.mood),
-        text: entry.text,
-      })),
+      gradient: `conic-gradient(#5daa6e 0deg ${positiveDeg}deg, #e3a35f ${positiveDeg}deg ${
+        positiveDeg + neutralDeg
+      }deg, #d16b5e ${positiveDeg + neutralDeg}deg 360deg)`,
+      labels: [
+        { key: "긍정", value: positive, color: "#4e8d5d" },
+        { key: "중립", value: neutral, color: "#ba814b" },
+        { key: "부담", value: negative, color: "#c45a4d" },
+      ],
     };
-  }, [journalList, uid, weeklyPoints, weeklyStats]);
+  }, [emotions]);
+  const weeklyLineMeta = useMemo(() => {
+    const width = 420;
+    const height = 160;
+    const xs = weeklyPoints.map((_, index) =>
+      Math.round((index / Math.max(1, weeklyPoints.length - 1)) * width)
+    );
+    const ys = weeklyPoints.map((point) => lineYFromMood(point.mood, height));
+    const linePoints = weeklyPoints
+      .map((_, index) => (ys[index] === null ? null : `${xs[index]},${ys[index]}`))
+      .filter((point): point is string => Boolean(point))
+      .join(" ");
+    return { width, height, xs, ys, linePoints };
+  }, [weeklyPoints]);
+
+  const latestChildEntries = useMemo(() => childList.slice(0, 20), [childList]);
+  const developerAuthors = useMemo(() => {
+    const counts = new Map<
+      string,
+      { key: string; uid: string; label: string; diary: number; child: number; lastDate: string; firstDate: string }
+    >();
+
+    for (const entry of journalList) {
+      const key = makeAuthorKey(entry.uid, entry.authorLabel);
+      const row = counts.get(key) ?? {
+        key,
+        uid: entry.uid || "-",
+        label: entry.authorLabel || entry.uid || "(알 수 없음)",
+        diary: 0,
+        child: 0,
+        lastDate: entry.date,
+        firstDate: entry.date,
+      };
+      row.diary += 1;
+      if (entry.date > row.lastDate) row.lastDate = entry.date;
+      if (entry.date < row.firstDate) row.firstDate = entry.date;
+      counts.set(key, row);
+    }
+
+    for (const entry of childList) {
+      const key = makeAuthorKey(entry.uid, entry.authorLabel);
+      const row = counts.get(key) ?? {
+        key,
+        uid: entry.uid || "-",
+        label: entry.authorLabel || entry.uid || "(알 수 없음)",
+        diary: 0,
+        child: 0,
+        lastDate: entry.date,
+        firstDate: entry.date,
+      };
+      row.child += 1;
+      if (entry.date > row.lastDate) row.lastDate = entry.date;
+      if (entry.date < row.firstDate) row.firstDate = entry.date;
+      counts.set(key, row);
+    }
+
+    return [...counts.values()].sort((a, b) => b.diary + b.child - (a.diary + a.child));
+  }, [childList, journalList]);
+  const filteredJournalEntries = useMemo(() => {
+    if (developerAuthorFilter === "all") return journalList;
+    return journalList.filter((entry) => makeAuthorKey(entry.uid, entry.authorLabel) === developerAuthorFilter);
+  }, [developerAuthorFilter, journalList]);
+  const filteredChildEntries = useMemo(() => {
+    if (developerAuthorFilter === "all") return childList;
+    return childList.filter((entry) => makeAuthorKey(entry.uid, entry.authorLabel) === developerAuthorFilter);
+  }, [childList, developerAuthorFilter]);
+  const combinedDeveloperActivities = useMemo(() => {
+    const journalActivities = filteredJournalEntries.map((entry) => ({
+      id: entry.id,
+      author: entry.authorLabel || entry.uid,
+      date: entry.date,
+      type: "일기",
+      summary: `기분 ${entry.mood}/10 · 에너지 ${entry.energy}/10 · 관계 ${entry.relationship}/10 · 성취 ${entry.achievement}/10`,
+      detail: entry.reflection || entry.text || "(소감 없음)",
+    }));
+
+    const childActivities = filteredChildEntries.map((entry) => ({
+      id: entry.id,
+      author: entry.authorLabel || entry.uid,
+      date: entry.date,
+      type: "육아일기",
+      summary: `변화 ${entry.progress}/10 · ${entry.childName || "자녀 이름 미입력"}`,
+      detail: `상황: ${entry.situation}${entry.intervention ? `\n시도: ${entry.intervention}` : ""}${entry.outcome ? `\n결과: ${entry.outcome}` : ""}`,
+    }));
+
+    return [...journalActivities, ...childActivities].sort((a, b) => b.date.localeCompare(a.date));
+  }, [filteredChildEntries, filteredJournalEntries]);
+  const groupedDiaryByDate = useMemo(
+    () => groupByDateDesc(filteredJournalEntries),
+    [filteredJournalEntries]
+  );
+  const groupedChildByDate = useMemo(
+    () => groupByDateDesc(filteredChildEntries),
+    [filteredChildEntries]
+  );
+  const groupedCombinedByDate = useMemo(
+    () => groupByDateDesc(combinedDeveloperActivities),
+    [combinedDeveloperActivities]
+  );
+
+  const diaryAnalysisBounds = useMemo(() => {
+    if (diaryAnalysisRange === "monthly") {
+      const year = diaryAnalysisMonth.getFullYear();
+      const month = diaryAnalysisMonth.getMonth();
+      return {
+        start: dateInputValue(new Date(year, month, 1)),
+        end: dateInputValue(new Date(year, month + 1, 0)),
+      };
+    }
+    if (diaryAnalysisRange === "custom") {
+      const start = diaryAnalysisStartDate || todayInputValue();
+      const end = diaryAnalysisEndDate || start;
+      return start <= end ? { start, end } : { start: end, end: start };
+    }
+    return {
+      start: dateInputValue(addDays(new Date(), -6)),
+      end: todayInputValue(),
+    };
+  }, [diaryAnalysisEndDate, diaryAnalysisMonth, diaryAnalysisRange, diaryAnalysisStartDate]);
+  const diaryAnalysisEntries = useMemo(() => {
+    const { start, end } = diaryAnalysisBounds;
+    return journalList.filter((entry) => entry.date >= start && entry.date <= end);
+  }, [diaryAnalysisBounds, journalList]);
+  const diaryAnalysisEntryText = useMemo(() => {
+    const useMedicationContext =
+      healthSettings.enabled && healthSettings.medicationEnabled && healthSettings.consented;
+    return diaryAnalysisEntries
+      .map((entry) => {
+        const meds = entry.medicationRecord
+          ? `${entry.medicationRecord.status}${
+              entry.medicationRecord.times.length ? ` (${entry.medicationRecord.times.join("/")})` : ""
+            }${entry.medicationRecord.name ? ` ${entry.medicationRecord.name}` : ""}${
+              entry.medicationRecord.category ? ` [${entry.medicationRecord.category}]` : ""
+            }${entry.medicationRecord.missedReason ? ` / 누락이유: ${entry.medicationRecord.missedReason}` : ""}`
+          : "(기록 없음)";
+        const base = `${entry.date} | 기분 ${entry.mood}/10 | 에너지 ${entry.energy}/10 | 관계 ${entry.relationship}/10 | 성취 ${
+          entry.achievement
+        }/10 | 감정 ${entry.emotions.join(", ") || "(없음)"}`;
+        const medPart = useMedicationContext ? ` | 투약체크 ${meds}` : "";
+        return `${base}${medPart} | 소감: ${entry.reflection || entry.text || "(없음)"}`;
+      })
+      .join("\n");
+  }, [diaryAnalysisEntries, healthSettings]);
+  const diaryAnalysisRangeLabel = useMemo(() => {
+    if (diaryAnalysisRange === "monthly") return "월간";
+    if (diaryAnalysisRange === "custom") return "기간 지정";
+    return "주간";
+  }, [diaryAnalysisRange]);
+
+  const diaryEntryMetaMap = useMemo(() => {
+    const byDate = new Map<string, JournalEntry[]>();
+    for (const entry of journalList) {
+      const bucket = byDate.get(entry.date) ?? [];
+      bucket.push(entry);
+      byDate.set(entry.date, bucket);
+    }
+    const meta = new Map<string, { hasEntry: boolean; avgMood: number | null; hasMedication: boolean }>();
+    byDate.forEach((entries, date) => {
+      meta.set(date, {
+        hasEntry: true,
+        avgMood: averageMood(entries.map((entry) => entry.mood)),
+        hasMedication: entries.some((entry) => Boolean(entry.medicationRecord)),
+      });
+    });
+    return meta;
+  }, [journalList]);
+
+  const diaryMonthDays = useMemo(() => {
+    const year = diaryAnalysisMonth.getFullYear();
+    const month = diaryAnalysisMonth.getMonth();
+    const first = new Date(year, month, 1);
+    const totalDays = new Date(year, month + 1, 0).getDate();
+    const leading = first.getDay();
+    const cells: Array<{
+      date: string;
+      day: number;
+      hasEntry: boolean;
+      avgMood: number | null;
+      hasMedication: boolean;
+      heatTone: string;
+      isFuture: boolean;
+    }> = [];
+
+    for (let i = 0; i < leading; i += 1) {
+      cells.push({
+        date: "",
+        day: 0,
+        hasEntry: false,
+        avgMood: null,
+        hasMedication: false,
+        heatTone: "none",
+        isFuture: false,
+      });
+    }
+
+    const today = todayInputValue();
+    for (let day = 1; day <= totalDays; day += 1) {
+      const date = dateInputValue(new Date(year, month, day));
+      const meta = diaryEntryMetaMap.get(date);
+      const avgMood = meta?.avgMood ?? null;
+      cells.push({
+        date,
+        day,
+        hasEntry: Boolean(meta?.hasEntry),
+        avgMood,
+        hasMedication: Boolean(meta?.hasMedication),
+        heatTone: moodHeatTone(avgMood),
+        isFuture: date > today,
+      });
+    }
+
+    return cells;
+  }, [diaryAnalysisMonth, diaryEntryMetaMap]);
+  const diaryInsights = useMemo(() => {
+    const valid = journalList.filter((entry) => Number.isFinite(entry.mood));
+    if (valid.length === 0) {
+      return { streak: 0, toughestDay: "-", strongestDay: "-" };
+    }
+    const dateSet = new Set(valid.map((entry) => entry.date));
+    let streak = 0;
+    while (true) {
+      const day = new Date();
+      day.setDate(day.getDate() - streak);
+      const key = dateInputValue(day);
+      if (!dateSet.has(key)) break;
+      streak += 1;
+    }
+    let minEntry = valid[0];
+    let maxEntry = valid[0];
+    for (const entry of valid) {
+      if (entry.mood < minEntry.mood) minEntry = entry;
+      if (entry.mood > maxEntry.mood) maxEntry = entry;
+    }
+    return {
+      streak,
+      toughestDay: `${minEntry.date} (${minEntry.mood}/10)`,
+      strongestDay: `${maxEntry.date} (${maxEntry.mood}/10)`,
+    };
+  }, [journalList]);
+  const weeklyAnalysisCards = useMemo(() => {
+    const summary = weeklyAiSummary.trim();
+    if (!summary) return [];
+    const lines = summary
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const pick = (keywords: string[], fallbackIndex: number) =>
+      lines.find((line) => keywords.some((keyword) => line.includes(keyword))) ??
+      lines[fallbackIndex] ??
+      "-";
+    return [
+      { title: "이번 주 감정 패턴", body: pick(["감정", "흐름", "패턴"], 0) },
+      { title: "반복되는 키워드", body: pick(["반복", "키워드", "주요"], 1) },
+      { title: "스트레스 요인", body: pick(["스트레스", "부담", "트리거"], 2) },
+      { title: "강점 요인", body: pick(["강점", "회복", "자원"], 3) },
+      { title: "다음 주 제안", body: pick(["제안", "실천", "다음"], 4) },
+    ];
+  }, [weeklyAiSummary]);
+  const weeklyFortuneReport = useMemo(() => {
+    const recent = [...journalList]
+      .sort((a, b) => b.date.localeCompare(a.date))
+      .slice(0, 7)
+      .filter((entry) => Boolean(entry.fortuneId));
+    if (recent.length === 0) {
+      return "최근 7일 조언 미션 기록이 아직 없습니다.";
+    }
+    const completed = recent.filter((entry) => entry.missionCompleted).length;
+    const overcameLowEnergy = recent.filter((entry) => {
+      if ((entry.fortuneId ?? "").includes("energy") || (entry.fortuneText ?? "").includes("지칠")) {
+        return entry.mood >= 7;
+      }
+      return false;
+    }).length;
+    const confidenceWins = recent.filter((entry) => {
+      if ((entry.fortuneId ?? "").includes("confidence")) {
+        return entry.achievement >= 7;
+      }
+      return false;
+    }).length;
+    return [
+      `조언 미션 완료: ${completed}/${recent.length}`,
+      `지침 예고를 극복한 날: ${overcameLowEnergy}일`,
+      `자신감 조언을 성취로 연결한 날: ${confidenceWins}일`,
+      completed >= Math.ceil(recent.length / 2)
+        ? "해석: 예측에 휘둘리지 않고 행동으로 패턴을 바꾸고 있습니다."
+        : "해석: 미션 실행 빈도를 조금만 높이면 감정 패턴이 더 빠르게 안정될 수 있어요.",
+    ].join("\n");
+  }, [journalList]);
+  const medicationPatternSummary = useMemo(() => {
+    if (!(healthSettings.enabled && healthSettings.medicationEnabled && healthSettings.consented)) {
+      return "";
+    }
+    const recent = [...diaryAnalysisEntries].filter((entry) => Boolean(entry.medicationRecord));
+    if (recent.length === 0) return "";
+    const taken = recent.filter((entry) => entry.medicationRecord?.status === "taken").length;
+    const partial = recent.filter((entry) => entry.medicationRecord?.status === "partial").length;
+    const skipped = recent.filter((entry) => entry.medicationRecord?.status === "skipped").length;
+    const missedReasons = recent
+      .map((entry) => entry.medicationRecord?.missedReason.trim() ?? "")
+      .filter(Boolean);
+    const reasonHint = missedReasons.length > 0 ? `누락 메모: ${missedReasons.slice(0, 3).join(" / ")}` : "";
+    return [
+      `분석 기간 투약 기록 ${recent.length}건`,
+      `잘 복용 ${taken}회 / 일부 놓침 ${partial}회 / 복용 안 함 ${skipped}회`,
+      reasonHint,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }, [diaryAnalysisEntries, healthSettings]);
+  const selectedDiaryEntries = useMemo(() => {
+    return journalList.filter((entry) => entry.date === journalDate);
+  }, [journalDate, journalList]);
 
   const childWeeklyPoints = useMemo<ChildPoint[]>(() => {
     const byDate = new Map<string, ChildEntry>();
@@ -651,7 +1886,7 @@ export default function Page() {
     for (let i = 6; i >= 0; i -= 1) {
       const day = new Date();
       day.setDate(day.getDate() - i);
-      const key = day.toISOString().slice(0, 10);
+      const key = dateInputValue(day);
       const entry = byDate.get(key);
       const label = `${day.getMonth() + 1}/${day.getDate()}`;
       points.push({
@@ -695,6 +1930,107 @@ export default function Page() {
       trend: trendLabel(delta),
     };
   }, [childWeeklyPoints]);
+  const childTimelineEntries = useMemo(() => {
+    return [...childList].sort((a, b) => {
+      const byDate = a.date.localeCompare(b.date);
+      if (byDate !== 0) return byDate;
+      return a.id.localeCompare(b.id);
+    });
+  }, [childList]);
+  const childEntryMetaMap = useMemo(() => {
+    const byDate = new Map<string, ChildEntry[]>();
+    for (const entry of childList) {
+      const bucket = byDate.get(entry.date) ?? [];
+      bucket.push(entry);
+      byDate.set(entry.date, bucket);
+    }
+    const meta = new Map<string, { hasEntry: boolean; avgScore: number | null }>();
+    byDate.forEach((entries, date) => {
+      meta.set(date, {
+        hasEntry: true,
+        avgScore: averageMood(entries.map((entry) => entry.progress)),
+      });
+    });
+    return meta;
+  }, [childList]);
+  const childMonthDays = useMemo(() => {
+    const year = childAnalysisMonth.getFullYear();
+    const month = childAnalysisMonth.getMonth();
+    const first = new Date(year, month, 1);
+    const totalDays = new Date(year, month + 1, 0).getDate();
+    const leading = first.getDay();
+    const cells: Array<{
+      date: string;
+      day: number;
+      hasEntry: boolean;
+      avgScore: number | null;
+      heatTone: string;
+      isFuture: boolean;
+    }> = [];
+    for (let i = 0; i < leading; i += 1) {
+      cells.push({
+        date: "",
+        day: 0,
+        hasEntry: false,
+        avgScore: null,
+        heatTone: "none",
+        isFuture: false,
+      });
+    }
+    const today = todayInputValue();
+    for (let day = 1; day <= totalDays; day += 1) {
+      const date = dateInputValue(new Date(year, month, day));
+      const meta = childEntryMetaMap.get(date);
+      const avgScore = meta?.avgScore ?? null;
+      cells.push({
+        date,
+        day,
+        hasEntry: Boolean(meta?.hasEntry),
+        avgScore,
+        heatTone: moodHeatTone(avgScore),
+        isFuture: date > today,
+      });
+    }
+    return cells;
+  }, [childAnalysisMonth, childEntryMetaMap]);
+  const selectedChildEntries = useMemo(() => {
+    return childList.filter((entry) => entry.date === childDate);
+  }, [childDate, childList]);
+
+  function childSignalTags(entry: ChildEntry) {
+    const tags: Array<{ label: string; tone: "risk" | "good" | "warn" }> = [];
+    const text = `${entry.situation} ${entry.outcome}`.toLowerCase();
+
+    if (entry.progress <= 3) tags.push({ label: "위험 신호", tone: "risk" });
+    if (entry.progress >= 8) tags.push({ label: "긍정 변화", tone: "good" });
+    if (!entry.aiSolution.trim()) tags.push({ label: "솔루션 미작성", tone: "warn" });
+    if (["악화", "거부", "공격", "폭발", "충돌"].some((keyword) => text.includes(keyword))) {
+      tags.push({ label: "즉시 점검 필요", tone: "risk" });
+    }
+
+    if (tags.length === 0) tags.push({ label: "관찰 유지", tone: "warn" });
+    return tags;
+  }
+
+  function renderHighlightedText(text: string) {
+    if (!text.trim()) return "(미입력)";
+    const regex = new RegExp(`(${childHighlightWords.join("|")})`, "g");
+    return text.split(regex).map((part, idx) => {
+      if (childHighlightWords.includes(part)) {
+        return (
+          <mark key={`${part}-${idx}`} className="textHighlight">
+            {part}
+          </mark>
+        );
+      }
+      return <span key={`txt-${idx}`}>{part}</span>;
+    });
+  }
+
+  useEffect(() => {
+    if (activeTab !== "counsel" || !intakeCompleted) return;
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [activeTab, intakeCompleted, loading, messages]);
 
   async function handleGoogleLogin() {
     setAuthSubmitting(true);
@@ -703,9 +2039,7 @@ export default function Page() {
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : "구글 로그인 중 오류가 발생했습니다.";
-      setAuthMessage(message);
+      setAuthMessage(authErrorMessage(error, "google"));
     } finally {
       setAuthSubmitting(false);
     }
@@ -716,55 +2050,85 @@ export default function Page() {
     setAuthMessage("");
 
     try {
+      const current = auth.currentUser;
+      if (current?.isAnonymous) {
+        await deleteUser(current);
+      }
+      const nextSession = crypto.randomUUID();
+      sessionStorage.setItem("guest_session_id", nextSession);
+      setGuestSessionId(nextSession);
       await signInAnonymously(auth);
     } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : "게스트 로그인 중 오류가 발생했습니다.";
-      setAuthMessage(message);
+      setAuthMessage(authErrorMessage(error, "guest"));
     } finally {
       setAuthSubmitting(false);
     }
   }
 
   async function handleEmailLogin() {
-    if (!email.trim() || !password.trim()) {
-      setAuthMessage("이메일과 비밀번호를 입력해 주세요.");
+    if (!accountId.trim() || !password.trim()) {
+      setAuthMessage("아이디와 비밀번호를 입력해 주세요.");
       return;
     }
 
     setAuthSubmitting(true);
     setAuthMessage("");
     try {
-      await signInWithEmailAndPassword(auth, email.trim(), password);
+      const credential = await signInWithEmailAndPassword(auth, toAuthEmail(accountId), password);
+      const profileSnap = await getDoc(doc(db, "users", credential.user.uid));
+      if (profileSnap.exists() && Boolean(profileSnap.data().disabled ?? false)) {
+        await signOut(auth);
+        setAuthMessage("삭제 처리된 계정입니다. 관리자에게 문의해 주세요.");
+        return;
+      }
       setAuthMessage("로그인되었습니다.");
+      setPassword("");
     } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : "이메일 로그인 중 오류가 발생했습니다.";
-      setAuthMessage(message);
+      setAuthMessage(authErrorMessage(error, "login"));
     } finally {
       setAuthSubmitting(false);
     }
   }
 
   async function handleEmailSignup() {
-    if (!email.trim() || !password.trim()) {
-      setAuthMessage("이메일과 비밀번호를 입력해 주세요.");
+    if (!nickname.trim() || !accountId.trim() || !password.trim() || !contact.trim()) {
+      setAuthMessage("이름(별명), 아이디, 비밀번호, 연락처를 모두 입력해 주세요.");
       return;
     }
     if (password.length < 6) {
       setAuthMessage("비밀번호는 6자 이상이어야 합니다.");
       return;
     }
+    if (!/^[a-z0-9._-]{4,20}$/i.test(accountId.trim())) {
+      setAuthMessage("아이디는 4~20자 영문/숫자/._- 형식으로 입력해 주세요.");
+      return;
+    }
+    if (!signupConsentAdminView) {
+      setAuthMessage("관리자 조회 동의 체크 후 회원가입할 수 있습니다.");
+      return;
+    }
 
     setAuthSubmitting(true);
     setAuthMessage("");
     try {
-      await createUserWithEmailAndPassword(auth, email.trim(), password);
-      setAuthMessage("회원가입이 완료되었습니다.");
+      const credential = await createUserWithEmailAndPassword(auth, toAuthEmail(accountId), password);
+      await setDoc(doc(db, "users", credential.user.uid), {
+        uid: credential.user.uid,
+        nickname: nickname.trim(),
+        accountId: normalizeAccountId(accountId),
+        contact: contact.trim(),
+        authEmail: toAuthEmail(accountId),
+        consentAdminView: signupConsentAdminView,
+        disabled: false,
+        createdAt: serverTimestamp(),
+      });
+      setAuthMessage("회원가입이 완료되었습니다. 아이디/비밀번호로 로그인할 수 있습니다.");
+      setSignupMode(false);
+      setNickname("");
+      setContact("");
+      setPassword("");
     } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : "회원가입 중 오류가 발생했습니다.";
-      setAuthMessage(message);
+      setAuthMessage(authErrorMessage(error, "signup"));
     } finally {
       setAuthSubmitting(false);
     }
@@ -773,6 +2137,7 @@ export default function Page() {
   async function handleLogout() {
     try {
       await signOut(auth);
+      sessionStorage.removeItem("guest_session_id");
       setActiveTab("counsel");
       setAuthMessage("로그아웃되었습니다.");
     } catch (error) {
@@ -781,37 +2146,521 @@ export default function Page() {
     }
   }
 
+  async function startNewChat() {
+    if (!uid) return;
+    if (isGuestUser) {
+      setActiveChatId(null);
+      setMessages([{ role: "assistant", text: DEFAULT_ASSISTANT_MESSAGE }]);
+      return;
+    }
+    const newChatId = crypto.randomUUID();
+    const firstMessage: Msg = { role: "assistant", text: DEFAULT_ASSISTANT_MESSAGE };
+    setActiveChatId(newChatId);
+    setMessages([firstMessage]);
+
+    await setDoc(
+      doc(db, "chats", newChatId),
+      {
+        uid,
+        track: selectedTrack,
+        title: "새 상담",
+        createdAt: serverTimestamp(),
+        lastMessageAt: serverTimestamp(),
+      },
+      { merge: true }
+    );
+  }
+
+  async function deleteChatThread(threadId: string) {
+    if (isGuestUser) return;
+    const selected = chatThreads.find((thread) => thread.id === threadId);
+    const label = selected?.title || "이 상담";
+    if (!window.confirm(`'${label}' 상담을 삭제할까요?`)) return;
+
+    try {
+      const messagesSnap = await getDocs(collection(db, "chats", threadId, "messages"));
+      if (messagesSnap.size > 0) {
+        const chunkSize = 450;
+        for (let i = 0; i < messagesSnap.docs.length; i += chunkSize) {
+          const batch = writeBatch(db);
+          messagesSnap.docs.slice(i, i + chunkSize).forEach((messageDoc) => {
+            batch.delete(messageDoc.ref);
+          });
+          await batch.commit();
+        }
+      }
+
+      await deleteDoc(doc(db, "chats", threadId));
+
+      if (activeChatId === threadId) {
+        const next = chatThreads.find((thread) => thread.id !== threadId);
+        setActiveChatId(next?.id ?? null);
+      }
+    } catch (error) {
+      console.error(error);
+      setAuthMessage("상담 목록 삭제 중 오류가 발생했습니다.");
+    }
+  }
+
+  async function requestAccountDeletion() {
+    if (!uid || isGuestUser) return;
+    const profileSnap = await getDoc(doc(db, "users", uid));
+    const profile = profileSnap.data();
+
+    await setDoc(
+      doc(db, "account-delete-requests", uid),
+      {
+        uid,
+        accountId: String(profile?.accountId ?? ""),
+        nickname: String(profile?.nickname ?? ""),
+        reason: deleteReason.trim() || "사용자 요청",
+        status: "pending",
+        requestedAt: serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    setDeleteReason("");
+    setAuthMessage("계정 삭제 요청이 접수되었습니다.");
+  }
+
+  async function processDeleteRequest(targetUid: string) {
+    if (!isDeveloper || deletingUid) return;
+    if (!window.confirm("이 사용자의 계정을 삭제 처리할까요?")) return;
+    setDeletingUid(targetUid);
+
+    try {
+      const journalQ = query(collection(db, "journals"), where("uid", "==", targetUid), limit(2000));
+      const childQ = query(collection(db, "child-workspaces"), where("uid", "==", targetUid), limit(2000));
+      const chatQ = query(collection(db, "chats"), where("uid", "==", targetUid), limit(2000));
+
+      const [journalSnap, childSnap, chatSnap] = await Promise.all([
+        getDocs(journalQ),
+        getDocs(childQ),
+        getDocs(chatQ),
+      ]);
+
+      for (const snap of [journalSnap, childSnap]) {
+        for (let i = 0; i < snap.docs.length; i += 450) {
+          const batch = writeBatch(db);
+          snap.docs.slice(i, i + 450).forEach((d) => batch.delete(d.ref));
+          await batch.commit();
+        }
+      }
+
+      for (const chatDoc of chatSnap.docs) {
+        const msgsSnap = await getDocs(collection(db, "chats", chatDoc.id, "messages"));
+        for (let i = 0; i < msgsSnap.docs.length; i += 450) {
+          const batch = writeBatch(db);
+          msgsSnap.docs.slice(i, i + 450).forEach((d) => batch.delete(d.ref));
+          await batch.commit();
+        }
+        await deleteDoc(chatDoc.ref);
+      }
+
+      await setDoc(
+        doc(db, "users", targetUid),
+        {
+          disabled: true,
+          deletedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+      await setDoc(
+        doc(db, "account-delete-requests", targetUid),
+        {
+          status: "processed",
+          processedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+    } catch (error) {
+      console.error(error);
+      setAuthMessage("삭제 처리 중 오류가 발생했습니다.");
+    } finally {
+      setDeletingUid(null);
+    }
+  }
+
+  async function submitExpertRequest() {
+    if (!uid) return;
+    if (!expertRequestText.trim()) {
+      setSaveStatus("전문가 요청 내용을 입력해 주세요.");
+      return;
+    }
+
+    try {
+      await addDoc(collection(db, "expert-requests"), {
+        uid,
+        guestSessionId: isGuestUser ? guestSessionId : null,
+        authorLabel: userEmail || uid,
+        category: expertCategory,
+        requestText: expertRequestText.trim(),
+        status: "open",
+        advisorReply: "",
+        advisorLabel: "",
+        createdAt: serverTimestamp(),
+      });
+      setExpertRequestText("");
+      setSaveStatus("전문가 요청이 등록되었습니다.");
+    } catch (error) {
+      console.error(error);
+      setSaveStatus("전문가 요청 등록 중 오류가 발생했습니다.");
+    }
+  }
+
+  async function saveExpertReply(request: ExpertRequest) {
+    if (!isDeveloper) return;
+    const reply = (replyDrafts[request.id] ?? "").trim();
+    if (!reply) {
+      setAuthMessage("조언 내용을 입력해 주세요.");
+      return;
+    }
+    try {
+      await setDoc(
+        doc(db, "expert-requests", request.id),
+        {
+          status: "answered",
+          advisorReply: reply,
+          advisorLabel: userEmail || authEmail || "관리자",
+          repliedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+      setReplyDrafts((prev) => ({ ...prev, [request.id]: "" }));
+    } catch (error) {
+      console.error(error);
+      setAuthMessage("전문가 조언 저장 중 오류가 발생했습니다.");
+    }
+  }
+
+  function addReflectionPrompt() {
+    const used = getReflectionPromptUsage(journalDate);
+    if (used >= REFLECTION_PROMPT_DAILY_LIMIT) {
+      setReflectionPromptCount(used);
+      setReflectionPromptMessage("오늘은 보조 질문을 3번 모두 사용했습니다.");
+      return;
+    }
+
+    const available = reflectionPromptPool.filter((prompt) => !reflection.includes(prompt));
+    const pool = available.length > 0 ? available : reflectionPromptPool;
+    const prompt = pool[Math.floor(Math.random() * pool.length)];
+    setReflection((prev) => (prev.trim() ? `${prev.trim()}\n\n${prompt}\n` : `${prompt}\n`));
+
+    const nextCount = used + 1;
+    setReflectionPromptUsage(journalDate, nextCount);
+    setReflectionPromptCount(nextCount);
+    setReflectionPromptMessage(`보조 질문 사용 ${nextCount}/${REFLECTION_PROMPT_DAILY_LIMIT}`);
+  }
+
+  function addFortuneMissionPrompt() {
+    const prompt = dailyFortune.prompt;
+    setReflection((prev) => (prev.trim() ? `${prev.trim()}\n\n${prompt}\n` : `${prompt}\n`));
+  }
+
+  function setModeAnswer(fieldKey: string, value: string) {
+    setModeAnswers((prev) => ({
+      ...prev,
+      [diaryMode]: {
+        ...(prev[diaryMode] ?? {}),
+        [fieldKey]: value,
+      },
+    }));
+  }
+
+  function toggleMedicationTime(time: string) {
+    setMedicationTimes((prev) =>
+      prev.includes(time) ? prev.filter((value) => value !== time) : [...prev, time]
+    );
+  }
+
+  async function saveHealthSettings(next: HealthSettings) {
+    setHealthSettings(next);
+    if (!uid) return;
+    if (isGuestUser) {
+      if (!guestSessionId) return;
+      window.localStorage.setItem(guestHealthSettingsKey(guestSessionId), JSON.stringify(next));
+      return;
+    }
+    await setDoc(
+      doc(db, "diary-settings", uid),
+      {
+        uid,
+        healthTrackingEnabled: next.enabled,
+        medicationTrackingEnabled: next.medicationEnabled,
+        healthConsent: next.consented,
+        updatedAt: serverTimestamp(),
+      },
+      { merge: true }
+    );
+  }
+
   async function saveJournal() {
     if (!uid) {
       setSaveStatus("아직 로그인 중이라 저장할 수 없습니다.");
       return;
     }
-
-    if (!journalText.trim()) {
-      setSaveStatus("내용을 먼저 입력해 주세요.");
+    if (isGuestUser && !guestSessionId) {
+      setSaveStatus("게스트 세션을 확인하는 중입니다. 잠시 후 다시 시도해 주세요.");
       return;
     }
 
-    try {
-      await addDoc(collection(db, "journals"), {
-        uid,
-        date: journalDate,
-        mood,
-        text: journalText.trim(),
-        createdAt: serverTimestamp(),
-      });
+    if (!composedDiaryText.trim()) {
+      setSaveStatus("모드 가이드 항목 또는 소감을 1개 이상 입력해 주세요.");
+      return;
+    }
 
-      setJournalText("");
-      setSaveStatus("저장 완료");
+    const hasMedicationInput =
+      medicationStatus !== "" ||
+      medicationTimes.length > 0 ||
+      medicationName.trim() ||
+      medicationCategory.trim() ||
+      medicationMemo.trim() ||
+      medicationMissedReason.trim();
+    const medicationRecord =
+      healthSettings.enabled && healthSettings.medicationEnabled && healthSettings.consented && hasMedicationInput
+        ? {
+            status: (medicationStatus || "taken") as "taken" | "partial" | "skipped",
+            times: medicationTimes,
+            name: medicationName.trim(),
+            category: medicationCategory.trim(),
+            note: medicationMemo.trim(),
+            missedReason: medicationMissedReason.trim(),
+          }
+        : null;
+
+    const payload = {
+      uid,
+      authorLabel: userEmail || uid,
+      guestSessionId: isGuestUser ? guestSessionId : null,
+      date: journalDate,
+      mode: diaryMode,
+      fortuneId: dailyFortune.id,
+      fortuneText: dailyFortune.fortune,
+      missionText: dailyFortune.mission,
+      missionCompleted: fortuneMissionDone,
+      medicationRecord,
+      mood,
+      energy,
+      relationship,
+      achievement,
+      emotions,
+      reflection: composedDiaryText.trim(),
+      text: composedDiaryText.trim(),
+    };
+
+    try {
+      if (editingJournalId) {
+        await updateDoc(doc(db, "journals", editingJournalId), {
+          ...payload,
+          updatedAt: serverTimestamp(),
+        });
+        setSaveStatus("일기 수정 완료");
+      } else {
+        await addDoc(collection(db, "journals"), {
+          ...payload,
+          createdAt: serverTimestamp(),
+        });
+        setSaveStatus("저장 완료");
+      }
+
+      setEditingJournalId(null);
+      setReflection("");
+      setMood(5);
+      setEnergy(5);
+      setRelationship(5);
+      setAchievement(5);
+      setEmotions([]);
+      setDiaryMode("general");
+      setFortuneMissionDone(false);
+      setHealthSectionOpen(false);
+      setMedicationStatus("");
+      setMedicationTimes([]);
+      setMedicationName("");
+      setMedicationCategory("");
+      setMedicationMemo("");
+      setMedicationMissedReason("");
+      setModeAnswers({
+        general: {},
+        abc: {},
+        guided: {},
+        reflection: {},
+      });
     } catch (error) {
       console.error(error);
       setSaveStatus("저장 실패: 콘솔을 확인해 주세요.");
     }
   }
 
-  async function analyzeWeeklyWithAi() {
-    if (!weeklyEntryText.trim()) {
-      setWeeklyAiSummary("최근 7일 일기 데이터가 없어서 분석할 수 없습니다.");
+  function editJournal(entry: JournalEntry) {
+    setEditingJournalId(entry.id);
+    setJournalDate(entry.date);
+    setMood(entry.mood);
+    setEnergy(entry.energy);
+    setRelationship(entry.relationship);
+    setAchievement(entry.achievement);
+    setEmotions(entry.emotions);
+    setDiaryMode(entry.mode ?? "general");
+    setFortuneMissionDone(Boolean(entry.missionCompleted));
+    setHealthSectionOpen(Boolean(entry.medicationRecord));
+    setMedicationStatus(entry.medicationRecord?.status ?? "");
+    setMedicationTimes(entry.medicationRecord?.times ?? []);
+    setMedicationName(entry.medicationRecord?.name ?? "");
+    setMedicationCategory(entry.medicationRecord?.category ?? "");
+    setMedicationMemo(entry.medicationRecord?.note ?? "");
+    setMedicationMissedReason(entry.medicationRecord?.missedReason ?? "");
+    setReflection(entry.reflection || entry.text);
+    setModeAnswers({
+      general: {},
+      abc: {},
+      guided: {},
+      reflection: {},
+    });
+    setSaveStatus("수정 모드입니다. 내용을 바꾼 뒤 저장해 주세요.");
+  }
+
+  function cancelJournalEdit() {
+    setEditingJournalId(null);
+    setJournalDate(todayInputValue());
+    setMood(5);
+    setEnergy(5);
+    setRelationship(5);
+    setAchievement(5);
+    setEmotions([]);
+    setDiaryMode("general");
+    setFortuneMissionDone(false);
+    setHealthSectionOpen(false);
+    setMedicationStatus("");
+    setMedicationTimes([]);
+    setMedicationName("");
+    setMedicationCategory("");
+    setMedicationMemo("");
+    setMedicationMissedReason("");
+    setReflection("");
+    setModeAnswers({
+      general: {},
+      abc: {},
+      guided: {},
+      reflection: {},
+    });
+    setSaveStatus("");
+  }
+
+  async function deleteJournal(entry: JournalEntry) {
+    const confirmMessage = `정말 삭제할까요?\n${entry.date} 일기`;
+    if (!window.confirm(confirmMessage)) return;
+
+    try {
+      await deleteDoc(doc(db, "journals", entry.id));
+      if (editingJournalId === entry.id) {
+        cancelJournalEdit();
+      }
+      setSaveStatus("일기 삭제 완료");
+    } catch (error) {
+      console.error(error);
+      setSaveStatus("일기 삭제 실패: 콘솔을 확인해 주세요.");
+    }
+  }
+
+  async function saveChildEntry() {
+    if (!uid) {
+      setChildSaveStatus("아직 로그인 중이라 저장할 수 없습니다.");
+      return;
+    }
+    if (isGuestUser && !guestSessionId) {
+      setChildSaveStatus("게스트 세션을 확인하는 중입니다. 잠시 후 다시 시도해 주세요.");
+      return;
+    }
+    if (!childSituation.trim()) {
+      setChildSaveStatus("자녀 상황을 먼저 입력해 주세요.");
+      return;
+    }
+
+    const payload = {
+      uid,
+      authorLabel: userEmail || uid,
+      guestSessionId: isGuestUser ? guestSessionId : null,
+      date: childDate,
+      childName: childName.trim(),
+      situation: childSituation.trim(),
+      intervention: childIntervention.trim(),
+      outcome: childOutcome.trim(),
+      progress: childProgress,
+      aiSolution: childAiSolution.trim(),
+    };
+
+    try {
+      if (editingChildId) {
+        await updateDoc(doc(db, "child-workspaces", editingChildId), {
+          ...payload,
+          updatedAt: serverTimestamp(),
+        });
+      setChildSaveStatus("육아 일기 수정 완료");
+      } else {
+        await addDoc(collection(db, "child-workspaces"), {
+          ...payload,
+          createdAt: serverTimestamp(),
+        });
+        setChildSaveStatus("육아 일기 저장 완료");
+      }
+
+      setEditingChildId(null);
+      setChildDate(todayInputValue());
+      setChildName("");
+      setChildSituation("");
+      setChildIntervention("");
+      setChildOutcome("");
+      setChildProgress(5);
+      setChildAiSolution("");
+    } catch (error) {
+      console.error(error);
+      setChildSaveStatus("육아 일기 저장 실패: 콘솔을 확인해 주세요.");
+    }
+  }
+
+  function editChildEntry(entry: ChildEntry) {
+    setEditingChildId(entry.id);
+    setChildDate(entry.date);
+    setChildName(entry.childName);
+    setChildSituation(entry.situation);
+    setChildIntervention(entry.intervention);
+    setChildOutcome(entry.outcome);
+    setChildProgress(entry.progress);
+    setChildAiSolution(entry.aiSolution);
+    setChildSaveStatus("수정 모드입니다. 내용을 바꾼 뒤 저장해 주세요.");
+  }
+
+  function cancelChildEdit() {
+    setEditingChildId(null);
+    setChildDate(todayInputValue());
+    setChildName("");
+    setChildSituation("");
+    setChildIntervention("");
+    setChildOutcome("");
+    setChildProgress(5);
+    setChildAiSolution("");
+    setChildSaveStatus("");
+  }
+
+  async function deleteChildEntry(entry: ChildEntry) {
+    const confirmMessage = `정말 삭제할까요?\n${entry.date} 육아 일기`;
+    if (!window.confirm(confirmMessage)) return;
+
+    try {
+      await deleteDoc(doc(db, "child-workspaces", entry.id));
+      if (editingChildId === entry.id) {
+        cancelChildEdit();
+      }
+      setChildSaveStatus("육아 일기 삭제 완료");
+    } catch (error) {
+      console.error(error);
+      setChildSaveStatus("육아 일기 삭제 실패: 콘솔을 확인해 주세요.");
+    }
+  }
+
+  async function analyzeDiaryWithAi() {
+    if (!diaryAnalysisEntryText.trim()) {
+      setWeeklyAiSummary(`${diaryAnalysisRangeLabel} 분석 기간에 일기 데이터가 없어서 분석할 수 없습니다.`);
       return;
     }
 
@@ -824,9 +2673,14 @@ export default function Page() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           track: "정서",
+          technique: selectedTechniqueForAnalysis,
           message:
-            "아래 최근 7일 일기를 보고 1)감정 흐름 2)스트레스 유발 요인 3)다음 주 실천 3가지를 간단히 정리해줘.\n\n" +
-            weeklyEntryText,
+            `아래 ${diaryAnalysisRangeLabel} 일기를 보고 1)감정 흐름 2)스트레스${
+              healthSettings.enabled && healthSettings.medicationEnabled && healthSettings.consented
+                ? "/투약 관련 패턴"
+                : " 패턴"
+            } 3)인지 왜곡 가능성 4)다음 실천 3가지를 간단히 정리해줘.\n\n` +
+            diaryAnalysisEntryText,
         }),
       });
 
@@ -839,15 +2693,15 @@ export default function Page() {
       setWeeklyAiSummary(data.reply ?? "분석 결과가 비어 있습니다.");
     } catch (error) {
       console.error(error);
-      setWeeklyAiSummary("주간 AI 분석 중 오류가 발생했습니다.");
+      setWeeklyAiSummary(`${diaryAnalysisRangeLabel} AI 분석 중 오류가 발생했습니다.`);
     } finally {
       setAnalyzing(false);
     }
   }
 
   async function send() {
-    if (expertIntent === "paid") return;
     if (!intakeCompleted) return;
+    if (!uid) return;
 
     const userText = input.trim();
     if (!userText || loading) return;
@@ -855,7 +2709,7 @@ export default function Page() {
     const text = [
       `카테고리: ${selectedTrackInfo.title}`,
       `상담 기법: ${currentTechnique.title}`,
-      `기본 정보: 나이 ${intake.age}, 현재 상황 ${intake.currentSituation}, 기간/빈도 ${intake.periodFrequency}, 가장 힘든 점 ${intake.hardestPoint}, 원하는 도움 방식 ${intake.helpStyle}`,
+      `기본 정보: 나이 ${intake.age}, 현재 상황 ${intake.currentSituation}, 기간/빈도 ${intake.periodFrequency}, 가장 힘든 점 ${intake.hardestPoint}`,
       `내용: ${userText}`,
     ].join("\n");
 
@@ -864,18 +2718,45 @@ export default function Page() {
     setLoading(true);
 
     try {
+      if (isGuestUser) {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: text,
+            riskMessage: userText,
+            track: selectedTrackInfo.apiTrack,
+            technique: selectedTechnique,
+          }),
+        });
+
+        if (!res.ok) {
+          const errText = await res.text();
+          throw new Error(`API Error ${res.status}: ${errText}`);
+        }
+
+        const data = (await res.json()) as { reply?: string };
+        const reply = data.reply ?? "응답 생성 실패";
+        setMessages((prev) => [...prev, { role: "assistant", text: reply }]);
+        return;
+      }
+
+      const targetChatId = activeChatId ?? crypto.randomUUID();
+      if (!activeChatId) setActiveChatId(targetChatId);
+
       await setDoc(
-        doc(db, "chats", chatId),
+        doc(db, "chats", targetChatId),
         {
           uid,
           track: selectedTrack,
+          title: userText.slice(0, 40),
           createdAt: serverTimestamp(),
           lastMessageAt: serverTimestamp(),
         },
         { merge: true }
       );
 
-      await addDoc(collection(db, "chats", chatId, "messages"), {
+      await addDoc(collection(db, "chats", targetChatId, "messages"), {
         role: "user",
         text,
         track: selectedTrack,
@@ -887,6 +2768,7 @@ export default function Page() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           message: text,
+          riskMessage: userText,
           track: selectedTrackInfo.apiTrack,
           technique: selectedTechnique,
         }),
@@ -902,12 +2784,20 @@ export default function Page() {
 
       setMessages((prev) => [...prev, { role: "assistant", text: reply }]);
 
-      await addDoc(collection(db, "chats", chatId, "messages"), {
+      await addDoc(collection(db, "chats", targetChatId, "messages"), {
         role: "assistant",
         text: reply,
         track: selectedTrack,
         createdAt: serverTimestamp(),
       });
+      await setDoc(
+        doc(db, "chats", targetChatId),
+        {
+          lastMessageAt: serverTimestamp(),
+          title: userText.slice(0, 40),
+        },
+        { merge: true }
+      );
     } catch (error) {
       console.error(error);
       setMessages((prev) => [
@@ -924,8 +2814,6 @@ export default function Page() {
 
   function selectTrack(track: Track) {
     setSelectedTrack(track.id);
-    setExpertIntent("idle");
-    setExpertStatus("");
     setMessages((prev) => [
       ...prev,
       {
@@ -950,12 +2838,14 @@ export default function Page() {
         body: JSON.stringify({
           track: "양육",
           message: [
-            "다음 내용을 REBT ABCDE 형식으로 상담 솔루션으로 정리해줘.",
+            `다음 내용을 ${currentChildTechnique.title} 방식으로 상담 솔루션으로 정리해줘.`,
+            "일반 AI 대화 모드면 상담 프레임 없이 이해하기 쉬운 실천 계획으로 제시해줘.",
             `자녀 이름: ${childName || "(미입력)"}`,
             `상황: ${childSituation}`,
             `부모가 시도한 방법: ${childIntervention || "(미입력)"}`,
             `현재 결과/변화: ${childOutcome || "(미입력)"}`,
           ].join("\n"),
+          technique: childTechnique,
         }),
       });
 
@@ -968,7 +2858,7 @@ export default function Page() {
       setChildAiSolution(data.reply ?? "솔루션이 비어 있습니다.");
     } catch (error) {
       console.error(error);
-      setChildAiSolution("자녀 상담 솔루션 생성 중 오류가 발생했습니다.");
+      setChildAiSolution("육아 일기 솔루션 생성 중 오류가 발생했습니다.");
     } finally {
       setChildAnalyzing(false);
     }
@@ -993,76 +2883,11 @@ export default function Page() {
         role: "assistant",
         text:
           "기본 정보 확인 완료. 이제 채팅을 시작할 수 있어요.\n" +
-          `나이: ${intake.age}\n현재 상황: ${intake.currentSituation}\n기간/빈도: ${intake.periodFrequency}\n가장 힘든 점: ${intake.hardestPoint}\n원하는 도움 방식: ${intake.helpStyle}`,
+          `나이: ${intake.age}\n현재 상황: ${intake.currentSituation}\n기간/빈도: ${intake.periodFrequency}\n가장 힘든 점: ${intake.hardestPoint}`,
       },
     ]);
   }
 
-  async function requestExpertConsultation() {
-    if (!uid) {
-      setExpertStatus("로그인 후 전문가 상담을 신청할 수 있습니다.");
-      return;
-    }
-
-    setExpertIntent("requested");
-    setExpertStatus("전문가 상담 신청이 접수되었습니다. 결제 후 상담 매칭이 시작됩니다.");
-
-    try {
-      await addDoc(collection(db, "expert-consult-requests"), {
-        uid,
-        track: selectedTrackInfo.title,
-        technique: currentTechnique.title,
-        intake,
-        testReport: expertReportFromTest || null,
-        status: "pending_payment",
-        amountKrw: 39000,
-        createdAt: serverTimestamp(),
-      });
-    } catch (error) {
-      console.error(error);
-      setExpertStatus("신청 저장 중 오류가 발생했습니다. 다시 시도해 주세요.");
-    }
-  }
-
-  function completeExpertPaymentDemo() {
-    setExpertIntent("paid");
-    setExpertStatus("결제 완료(데모). 이제 전문가와 실제 상담 단계로 전환됩니다.");
-  }
-
-  async function saveChildEntry() {
-    if (!uid) {
-      setChildSaveStatus("아직 로그인 중이라 저장할 수 없습니다.");
-      return;
-    }
-    if (!childSituation.trim()) {
-      setChildSaveStatus("자녀 상황을 먼저 입력해 주세요.");
-      return;
-    }
-
-    try {
-      await addDoc(collection(db, "child-workspaces"), {
-        uid,
-        date: childDate,
-        childName: childName.trim(),
-        situation: childSituation.trim(),
-        intervention: childIntervention.trim(),
-        outcome: childOutcome.trim(),
-        progress: childProgress,
-        aiSolution: childAiSolution.trim(),
-        createdAt: serverTimestamp(),
-      });
-
-      setChildSituation("");
-      setChildIntervention("");
-      setChildOutcome("");
-      setChildProgress(5);
-      setChildAiSolution("");
-      setChildSaveStatus("자녀 상담 기록 저장 완료");
-    } catch (error) {
-      console.error(error);
-      setChildSaveStatus("자녀 상담 기록 저장 실패: 콘솔을 확인해 주세요.");
-    }
-  }
 
   function startTest(testId: TestId) {
     setActiveTestId(testId);
@@ -1309,12 +3134,14 @@ export default function Page() {
 
   function connectExpertFromTest() {
     if (!testResult.trim()) return;
-    setExpertReportFromTest(testResult);
     setActiveTab("counsel");
-    setExpertIntent("asked");
-    setExpertStatus(
-      "검사 결과가 전문가 상담 연결 준비 상태입니다. '예, 전문가 상담 신청'을 누르면 결과 요약이 함께 전달됩니다."
-    );
+    setMessages((prev) => [
+      ...prev,
+      {
+        role: "assistant",
+        text: `검사 결과를 상담 워크스페이스로 가져왔어요.\n\n${testResult}`,
+      },
+    ]);
     setTestResultOpen(false);
   }
 
@@ -1341,11 +3168,10 @@ export default function Page() {
 
             <div className="authForm">
               <input
-                type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="이메일"
-                autoComplete="email"
+                value={accountId}
+                onChange={(e) => setAccountId(e.target.value)}
+                placeholder="아이디 (영문/숫자 4~20자)"
+                autoComplete="username"
               />
               <input
                 type="password"
@@ -1356,12 +3182,52 @@ export default function Page() {
               />
               <div className="authInlineActions">
                 <button onClick={handleEmailLogin} disabled={authSubmitting}>
-                  {authSubmitting ? "처리 중..." : "이메일 로그인"}
+                  {authSubmitting ? "처리 중..." : "아이디 로그인"}
                 </button>
-                <button className="signupBtn" onClick={handleEmailSignup} disabled={authSubmitting}>
-                  {authSubmitting ? "처리 중..." : "회원가입"}
+                <button className="signupBtn" onClick={() => setSignupMode((prev) => !prev)} disabled={authSubmitting}>
+                  {signupMode ? "회원가입 닫기" : "회원가입"}
                 </button>
               </div>
+              {signupMode && (
+                <div className="signupPanel">
+                  <input
+                    value={nickname}
+                    onChange={(e) => setNickname(e.target.value)}
+                    placeholder="이름(별명)"
+                    autoComplete="nickname"
+                  />
+                  <input
+                    value={contact}
+                    onChange={(e) => setContact(e.target.value)}
+                    placeholder="연락처"
+                    autoComplete="tel"
+                  />
+                  <input
+                    value={accountId}
+                    onChange={(e) => setAccountId(e.target.value)}
+                    placeholder="회원가입 아이디 (영문/숫자 4~20자)"
+                    autoComplete="username"
+                  />
+                  <input
+                    type="password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="회원가입 비밀번호 (6자 이상)"
+                    autoComplete="new-password"
+                  />
+                  <label className="consentRow">
+                    <input
+                      type="checkbox"
+                      checked={signupConsentAdminView}
+                      onChange={(e) => setSignupConsentAdminView(e.target.checked)}
+                    />
+                    <span>관리자 페이지에서 계정(아이디/연락처) 조회에 동의합니다.</span>
+                  </label>
+                  <button className="primaryBtn" onClick={handleEmailSignup} disabled={authSubmitting}>
+                    {authSubmitting ? "처리 중..." : "회원가입 완료"}
+                  </button>
+                </div>
+              )}
             </div>
 
             <div className="authDivider">또는</div>
@@ -1391,9 +3257,27 @@ export default function Page() {
           </section>
 
           <section className="userBar">
-            <p>{isGuestUser ? "게스트 사용자" : userEmail}</p>
+            <p>
+              {isGuestUser ? "게스트 사용자" : userEmail}
+              {isDeveloper ? " (개발자 모드: 전체 기록 조회 가능)" : ""}
+            </p>
             <button onClick={handleLogout}>로그아웃</button>
           </section>
+          {!isGuestUser && (
+            <section className="userBar">
+              <input
+                value={deleteReason}
+                onChange={(e) => setDeleteReason(e.target.value)}
+                placeholder="계정 삭제 요청 사유 (선택)"
+              />
+              <button onClick={requestAccountDeletion}>계정 삭제 요청</button>
+            </section>
+          )}
+          {isGuestUser && (
+            <section className="userBar">
+              <p>게스트 로그인은 기기/세션에 따라 누적 기록이 보장되지 않습니다. 이메일/Google 로그인을 권장합니다.</p>
+            </section>
+          )}
 
           <section className="topTabs">
             <button
@@ -1412,7 +3296,7 @@ export default function Page() {
               className={`tabBtn ${activeTab === "child" ? "active" : ""}`}
               onClick={() => setActiveTab("child")}
             >
-              자녀 상담
+              육아 일기
             </button>
             <button
               className={`tabBtn ${activeTab === "tests" ? "active" : ""}`}
@@ -1420,10 +3304,49 @@ export default function Page() {
             >
               검사하기
             </button>
+            {isDeveloper && (
+              <button
+                className={`tabBtn ${activeTab === "admin" ? "active" : ""}`}
+                onClick={() => setActiveTab("admin")}
+              >
+                관리자 페이지
+              </button>
+            )}
           </section>
 
           {activeTab === "counsel" && (
-            <>
+            <section className={`counselWorkspace ${isGuestUser ? "guest" : ""}`}>
+              {!isGuestUser && (
+                <aside className="threadSidebar">
+                <div className="threadPanel">
+                  <div className="threadPanelHead">
+                    <strong>이전 상담 목록</strong>
+                    <button className="ghostBtn" onClick={startNewChat}>
+                      새 상담
+                    </button>
+                  </div>
+                  <div className="threadList">
+                    {chatThreads.length === 0 && <p className="emptyText">저장된 상담이 없습니다.</p>}
+                    {chatThreads.map((thread) => (
+                      <div key={thread.id} className={`threadItem ${activeChatId === thread.id ? "active" : ""}`}>
+                        <button className="threadSelectBtn" onClick={() => setActiveChatId(thread.id)}>
+                          <strong>{thread.title || "새 상담"}</strong>
+                          <span>{thread.id.slice(0, 8)}</span>
+                        </button>
+                        <button
+                          className="threadDeleteBtn"
+                          onClick={() => deleteChatThread(thread.id)}
+                          title="상담 삭제"
+                        >
+                          삭제
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </aside>
+              )}
+
               <section className="composerCard chatSurface">
                 <div className="cozyRibbon" aria-hidden>
                   <span>☕</span>
@@ -1506,16 +3429,6 @@ export default function Page() {
                           placeholder="예: 감정 조절이 어렵고 죄책감이 큼"
                         />
                       </label>
-                      <label>
-                        원하는 도움 방식
-                        <input
-                          value={intake.helpStyle}
-                          onChange={(e) =>
-                            setIntake((prev) => ({ ...prev, helpStyle: e.target.value }))
-                          }
-                          placeholder="예: 단계별 실천 과제 중심"
-                        />
-                      </label>
                     </div>
                     <button className="primaryBtn" onClick={completeIntake}>
                       기본 정보 입력 완료 후 채팅 시작
@@ -1524,7 +3437,7 @@ export default function Page() {
                   </div>
                 )}
 
-                {intakeCompleted && expertIntent !== "paid" && (
+                {intakeCompleted && (
                   <>
                     <div className="chatBox chatViewport">
                       {messages.map((m, i) => (
@@ -1533,6 +3446,7 @@ export default function Page() {
                           <p>{m.text}</p>
                         </div>
                       ))}
+                      <div ref={chatEndRef} />
                     </div>
 
                     <div className="inputRow chatComposer">
@@ -1543,65 +3457,23 @@ export default function Page() {
                         placeholder="메시지를 입력하세요. Enter 전송, Shift+Enter 줄바꿈"
                         rows={4}
                       />
-                      <p className="summaryText">
-                        {loading ? "응답을 생성하고 있습니다..." : "Enter로 바로 전송됩니다."}
-                      </p>
+                      <div className="chatSendRow">
+                        <p className="summaryText">
+                          {loading ? "응답을 생성하고 있습니다..." : "Enter 또는 전송 버튼으로 보낼 수 있습니다."}
+                        </p>
+                        <button className="primaryBtn" onClick={send} disabled={loading || !input.trim()}>
+                          {loading ? "전송 중..." : "전송"}
+                        </button>
+                      </div>
                     </div>
                   </>
-                )}
-
-                {intakeCompleted && expertIntent === "paid" && (
-                  <div className="urgent">
-                    전문가 상담 단계로 전환되었습니다. 결제 완료 건은 상담사 매칭 후 일정 안내가 진행됩니다.
-                  </div>
                 )}
 
                 {selectedTrack === "crisis" && (
                   <div className="urgent">위기 상황이면 즉시 1393, 112, 119에 연락하세요.</div>
                 )}
-
-                <article className="expertCard">
-                  <h3>전문가와 상담하기</h3>
-                  <p>
-                    현재 카테고리: <strong>{selectedTrackInfo.title}</strong> / 상담 기법:{" "}
-                    <strong>{currentTechnique.title}</strong>
-                  </p>
-                  <p className="summaryText">AI 상담 후 전문가 상담을 진행하시겠습니까?</p>
-                  {expertReportFromTest && (
-                    <pre className="analysisBox">
-                      검사결과 요약(전문가 전달 예정):
-                      {"\n"}
-                      {expertReportFromTest}
-                    </pre>
-                  )}
-                  {expertIntent === "idle" && (
-                    <div className="expertActions">
-                      <button className="primaryBtn" onClick={() => setExpertIntent("asked")}>
-                        상담 의사 확인
-                      </button>
-                    </div>
-                  )}
-                  {expertIntent === "asked" && (
-                    <div className="expertActions">
-                      <button className="primaryBtn" onClick={requestExpertConsultation}>
-                        예, 전문가 상담 신청
-                      </button>
-                      <button className="ghostBtn" onClick={() => setExpertIntent("idle")}>
-                        아니요
-                      </button>
-                    </div>
-                  )}
-                  {expertIntent === "requested" && (
-                    <div className="expertActions">
-                      <button className="primaryBtn" onClick={completeExpertPaymentDemo}>
-                        39,000원 결제하기(데모)
-                      </button>
-                    </div>
-                  )}
-                  {expertStatus && <p className="statusText">{expertStatus}</p>}
-                </article>
               </section>
-            </>
+            </section>
           )}
 
           {activeTab === "diary" && (
@@ -1612,9 +3484,96 @@ export default function Page() {
                 <div className="sceneBook" />
                 <p>따뜻한 공간에서 오늘의 마음을 천천히 기록해보세요.</p>
               </article>
-              <article className="panel">
+              {healthSettingsOpen && (
+                <div className="healthModalOverlay">
+                  <article className="healthModalSheet">
+                    <h3>건강 추적 설정</h3>
+                    <label className="checkRow">
+                      <input
+                        type="checkbox"
+                        checked={healthSettings.enabled}
+                        onChange={(e) =>
+                          setHealthSettings((prev) => ({
+                            ...prev,
+                            enabled: e.target.checked,
+                            medicationEnabled: e.target.checked ? prev.medicationEnabled : false,
+                          }))
+                        }
+                      />
+                      건강 추적 기능 사용
+                    </label>
+                    <label className="checkRow">
+                      <input
+                        type="checkbox"
+                        checked={healthSettings.medicationEnabled}
+                        disabled={!healthSettings.enabled}
+                        onChange={(e) =>
+                          setHealthSettings((prev) => ({
+                            ...prev,
+                            medicationEnabled: e.target.checked,
+                          }))
+                        }
+                      />
+                      투약 추적 사용
+                    </label>
+                    <div className="healthConsentBox">
+                      <p>민감정보 안내: 건강 정보는 AI 분석 보조를 위해 저장되며, 입력은 언제나 선택입니다.</p>
+                      <label className="checkRow">
+                        <input
+                          type="checkbox"
+                          checked={healthSettings.consented}
+                          onChange={(e) =>
+                            setHealthSettings((prev) => ({
+                              ...prev,
+                              consented: e.target.checked,
+                            }))
+                          }
+                        />
+                        민감정보 안내를 확인했고 동의합니다.
+                      </label>
+                    </div>
+                    <div className="cardActions">
+                      <button
+                        className="primaryBtn"
+                        onClick={async () => {
+                          try {
+                            await saveHealthSettings(healthSettings);
+                            setHealthSettingsOpen(false);
+                          } catch (error) {
+                            console.error(error);
+                            setSaveStatus("건강 추적 설정 저장 중 오류가 발생했습니다.");
+                          }
+                        }}
+                      >
+                        설정 저장
+                      </button>
+                      <button className="ghostBtn" onClick={() => setHealthSettingsOpen(false)}>
+                        닫기
+                      </button>
+                    </div>
+                  </article>
+                </div>
+              )}
+              <article className="panel diaryWriterPanel">
                 <h2>오늘 일기 작성</h2>
                 <div className="diaryForm">
+                  <div className="modePicker">
+                    <span>상담 모드</span>
+                    <div className="modeGrid">
+                      {diaryModes.map((mode) => (
+                        <button
+                          key={mode.id}
+                          type="button"
+                          className={`modeChip ${diaryMode === mode.id ? "active" : ""}`}
+                          onClick={() => setDiaryMode(mode.id)}
+                        >
+                          {mode.title}
+                        </button>
+                      ))}
+                    </div>
+                    <p className="summaryText">{currentDiaryMode.description}</p>
+                  </div>
+
                   <label>
                     날짜
                     <input
@@ -1623,9 +3582,124 @@ export default function Page() {
                       onChange={(e) => setJournalDate(e.target.value)}
                     />
                   </label>
+                  <div className="healthTopRow">
+                    <button type="button" className="ghostBtn" onClick={() => setHealthSettingsOpen(true)}>
+                      건강 추적 설정
+                    </button>
+                    <span className="summaryText">
+                      {healthSettings.enabled && healthSettings.medicationEnabled && healthSettings.consented
+                        ? "건강 추적 ON"
+                        : "건강 추적 OFF"}
+                    </span>
+                  </div>
 
+                  <div className="fortuneCard">
+                    <h3>오늘의 조언</h3>
+                    <p>{dailyFortune.fortune}</p>
+                    <div className="fortuneMission">
+                      <strong>오늘의 미션</strong>
+                      <p>{dailyFortune.mission}</p>
+                    </div>
+                    <div className="cardActions">
+                      <button type="button" className="ghostBtn" onClick={addFortuneMissionPrompt}>
+                        미션 질문 일기에 넣기
+                      </button>
+                    </div>
+                    <label className="checkRow">
+                      <input
+                        type="checkbox"
+                        checked={fortuneMissionDone}
+                        onChange={(e) => setFortuneMissionDone(e.target.checked)}
+                      />
+                      오늘 미션 완료
+                    </label>
+                  </div>
+                  {healthSettings.enabled &&
+                    healthSettings.medicationEnabled &&
+                    healthSettings.consented &&
+                    (healthSectionOpen ? (
+                      <div className="medCard">
+                        <div className="medHead">
+                          <h3>건강 기록: 투약</h3>
+                          <button type="button" className="ghostBtn" onClick={() => setHealthSectionOpen(false)}>
+                            접기
+                          </button>
+                        </div>
+                        <label>
+                          오늘 복용 상태
+                          <select
+                            value={medicationStatus}
+                            onChange={(e) =>
+                              setMedicationStatus(e.target.value as "" | "taken" | "partial" | "skipped")
+                            }
+                          >
+                            <option value="">선택 안 함</option>
+                            <option value="taken">잘 복용</option>
+                            <option value="partial">일부 놓침</option>
+                            <option value="skipped">복용 안 함</option>
+                          </select>
+                        </label>
+                        <div className="timeChipRow">
+                          {["아침", "점심", "저녁", "취침 전"].map((time) => (
+                            <button
+                              key={`med-time-${time}`}
+                              type="button"
+                              className={`modeChip ${medicationTimes.includes(time) ? "active" : ""}`}
+                              onClick={() => toggleMedicationTime(time)}
+                            >
+                              {time}
+                            </button>
+                          ))}
+                        </div>
+                        <label>
+                          약 종류(선택)
+                          <select value={medicationCategory} onChange={(e) => setMedicationCategory(e.target.value)}>
+                            <option value="">선택 안 함</option>
+                            <option value="감기약">감기약</option>
+                            <option value="진통제">진통제</option>
+                            <option value="수면">수면</option>
+                            <option value="정신건강">정신건강</option>
+                            <option value="소화">소화</option>
+                            <option value="기타">기타</option>
+                          </select>
+                        </label>
+                        <label>
+                          약 이름(선택)
+                          <input
+                            value={medicationName}
+                            onChange={(e) => setMedicationName(e.target.value)}
+                            placeholder="예: OO정 0.5mg"
+                          />
+                        </label>
+                        <label>
+                          메모(선택)
+                          <input
+                            value={medicationMemo}
+                            onChange={(e) => setMedicationMemo(e.target.value)}
+                            placeholder="복용 후 상태를 짧게 기록"
+                          />
+                        </label>
+                        {(medicationStatus === "partial" || medicationStatus === "skipped") && (
+                          <label>
+                            복용 누락 이유(선택)
+                            <input
+                              value={medicationMissedReason}
+                              onChange={(e) => setMedicationMissedReason(e.target.value)}
+                              placeholder="예: 외출, 깜빡함, 부작용 우려"
+                            />
+                          </label>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="healthAddRow">
+                        <button type="button" className="ghostBtn" onClick={() => setHealthSectionOpen(true)}>
+                          + 건강 기록 추가
+                        </button>
+                        <span className="summaryText">필요할 때만 입력하세요. 일기 저장에 필수 아님</span>
+                      </div>
+                    ))}
                   <label>
-                    오늘의 기분 ({mood}/10)
+                    오늘 전체적인 기분 ({mood}/10)
                     <input
                       type="range"
                       min={1}
@@ -1635,78 +3709,659 @@ export default function Page() {
                     />
                   </label>
 
-                  <textarea
-                    value={journalText}
-                    onChange={(e) => setJournalText(e.target.value)}
-                    placeholder="오늘 있었던 일, 감정, 생각을 자유롭게 적어보세요."
-                    rows={8}
-                  />
+                  <label>
+                    오늘의 에너지 상태 ({energy}/10)
+                    <input
+                      type="range"
+                      min={1}
+                      max={10}
+                      value={energy}
+                      onChange={(e) => setEnergy(Number(e.target.value))}
+                    />
+                  </label>
+
+                  <label>
+                    사람과의 관계 ({relationship}/10)
+                    <input
+                      type="range"
+                      min={1}
+                      max={10}
+                      value={relationship}
+                      onChange={(e) => setRelationship(Number(e.target.value))}
+                    />
+                  </label>
+
+                  <label>
+                    오늘의 성취감 ({achievement}/10)
+                    <input
+                      type="range"
+                      min={1}
+                      max={10}
+                      value={achievement}
+                      onChange={(e) => setAchievement(Number(e.target.value))}
+                    />
+                  </label>
+
+                  <div className="emotionPicker">
+                    <span>감정 체크하기 (복수선택)</span>
+                    <div className="emotionGrid">
+                      {emotionOptions.map((emotion) => {
+                        const selected = emotions.includes(emotion);
+                        return (
+                          <button
+                            key={emotion}
+                            type="button"
+                            className={`emotionChip ${selected ? "active" : ""}`}
+                            onClick={() =>
+                              setEmotions((prev) =>
+                                prev.includes(emotion)
+                                  ? prev.filter((item) => item !== emotion)
+                                  : [...prev, emotion]
+                              )
+                            }
+                          >
+                            {emotion}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <p className="liveSummary">{emotionSummary}</p>
+                  </div>
+
+                  {diaryMode !== "general" && (
+                    <div className="modeGuideCard">
+                      <h3>{currentModeGuide.title}</h3>
+                      <p>{currentModeGuide.description}</p>
+                      <div className="guideSteps">
+                        {currentModeGuide.steps.map((step, idx) => (
+                          <span key={`${diaryMode}-step-${idx}`}>
+                            {idx + 1}. {step}
+                          </span>
+                        ))}
+                      </div>
+                      <p className="summaryText">
+                        가이드 입력 {modeFilledCount}/{currentModeGuide.fields.length}
+                      </p>
+                      <div className="modeFieldGrid">
+                        {currentModeGuide.fields.map((field) => (
+                          <label key={`${diaryMode}-${field.key}`}>
+                            {field.label}
+                            <textarea
+                              value={currentModeAnswers[field.key] ?? ""}
+                              onChange={(e) => setModeAnswer(field.key, e.target.value)}
+                              placeholder={field.placeholder}
+                              rows={2}
+                            />
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <label>
+                    {diaryMode === "general" ? "오늘의 하루에 대한 자기 소감" : "자유 메모 (선택)"}
+                    <textarea
+                      value={reflection}
+                      onChange={(e) => setReflection(e.target.value)}
+                      placeholder={currentModeGuide.freePlaceholder}
+                      rows={5}
+                    />
+                  </label>
+                  <div className="textMetaRow">
+                    <span>글자 수: {reflectionLength}</span>
+                    <button
+                      type="button"
+                      className="ghostBtn"
+                      onClick={addReflectionPrompt}
+                      disabled={reflectionPromptCount >= REFLECTION_PROMPT_DAILY_LIMIT}
+                    >
+                      보조 질문 넣기
+                    </button>
+                  </div>
+                  <p className="summaryText">
+                    보조 질문 남은 횟수: {Math.max(0, REFLECTION_PROMPT_DAILY_LIMIT - reflectionPromptCount)}/
+                    {REFLECTION_PROMPT_DAILY_LIMIT}
+                  </p>
+                  {reflectionPromptMessage && <p className="summaryText">{reflectionPromptMessage}</p>}
+                  <div className="keySentenceBox">
+                    <strong>오늘의 핵심 문장</strong>
+                    <p>{keySentence || "소감을 입력하면 핵심 문장이 자동 추출됩니다."}</p>
+                  </div>
+                  <label className="checkRow">
+                    <input
+                      type="checkbox"
+                      checked={liveCommentEnabled}
+                      onChange={(e) => setLiveCommentEnabled(e.target.checked)}
+                    />
+                    입력 중 실시간 AI 코멘트 보기
+                  </label>
+                  {liveAiComment && <p className="liveComment">{liveAiComment}</p>}
 
                   <button className="primaryBtn" onClick={saveJournal}>
-                    일기 저장
+                    {editingJournalId ? "일기 수정 저장" : "일기 저장"}
                   </button>
+                  {editingJournalId && (
+                    <button className="ghostBtn" onClick={cancelJournalEdit}>
+                      수정 취소
+                    </button>
+                  )}
                   {saveStatus && <p className="statusText">{saveStatus}</p>}
+                </div>
+                <div className="diaryDashboard">
+                  <div className="metricCard">
+                    <h3>오늘 종합 점수</h3>
+                    <div className="gaugeWrap">
+                      <svg viewBox="0 0 120 120" className="gaugeSvg" role="img" aria-label="오늘 종합 점수">
+                        <circle cx="60" cy="60" r="48" className="gaugeTrack" />
+                        <circle
+                          cx="60"
+                          cy="60"
+                          r="48"
+                          className="gaugeValue"
+                          style={{ strokeDasharray: `${Math.round((todayCompositeScore / 100) * 302)} 302` }}
+                        />
+                      </svg>
+                      <div className="gaugeCenter">
+                        <strong>{todayCompositeScore}</strong>
+                        <span>{todayCompositeMood}/10</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="metricCard">
+                    <h3>감정 분포</h3>
+                    <div className="donutWrap">
+                      <div className="donutChart" style={{ backgroundImage: emotionDonut.gradient }} />
+                      <div className="donutLegend">
+                        {emotionDonut.labels.map((item) => (
+                          <p key={item.key}>
+                            <span className="legendDot" style={{ background: item.color }} />
+                            {item.key} {item.value}
+                          </p>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </article>
+
+              <article className="panel diaryCalendarPanel">
+                <h2>일기 달력</h2>
+                <div className="calendarHead">
+                  <button
+                    className="ghostBtn"
+                    onClick={() =>
+                      setDiaryAnalysisMonth(
+                        (prev) => new Date(prev.getFullYear(), prev.getMonth() - 1, 1)
+                      )
+                    }
+                  >
+                    이전 달
+                  </button>
+                  <strong>
+                    {diaryAnalysisMonth.getFullYear()}년 {diaryAnalysisMonth.getMonth() + 1}월
+                  </strong>
+                  <button
+                    className="ghostBtn"
+                    onClick={() =>
+                      setDiaryAnalysisMonth(
+                        (prev) => new Date(prev.getFullYear(), prev.getMonth() + 1, 1)
+                      )
+                    }
+                  >
+                    다음 달
+                  </button>
+                </div>
+                <div className="calendarWeekdays">
+                  {["일", "월", "화", "수", "목", "금", "토"].map((day) => (
+                    <span key={day}>{day}</span>
+                  ))}
+                </div>
+                <div className="calendarGrid">
+                  {diaryMonthDays.map((cell, idx) => {
+                    if (!cell.date) {
+                      return <div key={`empty-${idx}`} className="calendarCell empty" />;
+                    }
+
+                    return (
+                      <button
+                        key={cell.date}
+                        type="button"
+                        className={`calendarCell ${cell.hasEntry ? "done" : "todo"} ${
+                          cell.isFuture ? "future" : ""
+                        } ${cell.hasEntry ? `heat-${cell.heatTone}` : ""}`}
+                        onClick={() => setJournalDate(cell.date)}
+                      >
+                        <strong>{cell.day}</strong>
+                        <span>
+                          {cell.isFuture ? "-" : cell.hasEntry ? "작성" : "미작성"}
+                        </span>
+                        {cell.hasEntry && <em>{cell.avgMood}/10</em>}
+                        {cell.hasMedication && <i className="medDot" aria-hidden />}
+                      </button>
+                    );
+                  })}
+                </div>
+                <div className="heatLegend">
+                  <span>
+                    <i className="legendSwatch heat-good" />
+                    7 이상
+                  </span>
+                  <span>
+                    <i className="legendSwatch heat-mid" />
+                    4~6
+                  </span>
+                  <span>
+                    <i className="legendSwatch heat-low" />
+                    3 이하
+                  </span>
+                  <span>
+                    <i className="medDot" />
+                    투약 기록 있음
+                  </span>
+                </div>
+                <p className="summaryText">
+                  달력 날짜를 누르면 작성 날짜가 자동 선택됩니다.
+                </p>
+                <div className="quickTrendRow">
+                  <span>기록일 {weeklyStats.daysWithEntry}일</span>
+                  <span>평균 {weeklyStats.average ?? "-"}</span>
+                  <span>추세 {weeklyStats.trend}</span>
+                </div>
+                <div className="dayEntryList">
+                  <div className="panelHeadRow">
+                    <h3>{journalDate} 작성 일기</h3>
+                    <button className="ghostBtn" onClick={() => setDiaryDayListOpen((prev) => !prev)}>
+                      {diaryDayListOpen ? "접기" : "펼치기"}
+                    </button>
+                  </div>
+                  {diaryDayListOpen && (
+                    <>
+                      {selectedDiaryEntries.length === 0 && (
+                        <p className="emptyText">선택한 날짜에 작성한 일기가 없습니다.</p>
+                      )}
+                      {selectedDiaryEntries.map((entry) => (
+                        <div key={`day-diary-${entry.id}`} className="dayEntryCard">
+                          {entry.fortuneText && <p className="summaryText">조언: {entry.fortuneText}</p>}
+                          {entry.missionText && (
+                            <p className="summaryText">
+                              미션: {entry.missionText} {entry.missionCompleted ? "✅" : "⬜"}
+                            </p>
+                          )}
+                          {entry.medicationRecord && (
+                            <p className="summaryText">
+                              투약 기록: {entry.medicationRecord.status}
+                              {entry.medicationRecord.times.length
+                                ? ` · ${entry.medicationRecord.times.join("/")}`
+                                : ""}
+                              {entry.medicationRecord.name ? ` · ${entry.medicationRecord.name}` : ""}
+                              {entry.medicationRecord.category ? ` · ${entry.medicationRecord.category}` : ""}
+                            </p>
+                          )}
+                          <p className="summaryText">
+                            모드: {diaryModes.find((mode) => mode.id === (entry.mode ?? "general"))?.title ?? "일반 일기 모드"}
+                          </p>
+                          {isDeveloper && <p className="summaryText">작성자: {entry.authorLabel || entry.uid}</p>}
+                          <p className="summaryText">
+                            기분 {entry.mood}/10 · 에너지 {entry.energy}/10 · 관계 {entry.relationship}/10 · 성취{" "}
+                            {entry.achievement}/10
+                          </p>
+                          <p className="summaryText">감정: {entry.emotions.join(", ") || "(선택 없음)"}</p>
+                          <p>{entry.reflection || entry.text || "(내용 없음)"}</p>
+                          <div className="cardActions">
+                            <button className="ghostBtn" onClick={() => editJournal(entry)}>
+                              수정
+                            </button>
+                            <button className="ghostBtn dangerBtn" onClick={() => deleteJournal(entry)}>
+                              삭제
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </>
+                  )}
                 </div>
               </article>
 
               <article className="panel">
-                <h2>최근 일기</h2>
-                <div className="journalList">
-                  {latestEntries.length === 0 && <p className="emptyText">저장된 일기가 없습니다.</p>}
-                  {latestEntries.map((entry) => (
-                    <div key={entry.id} className="journalCard">
-                      <div className="journalMeta">
-                        <strong>{entry.date}</strong>
-                        <span>
-                          기분 {entry.mood}/10 ({moodLabel(entry.mood)})
-                        </span>
-                      </div>
-                      <p>{entry.text}</p>
+                <h2>전문가에게 요청하기</h2>
+                <div className="diaryForm">
+                  <label>
+                    요청 카테고리
+                    <select value={expertCategory} onChange={(e) => setExpertCategory(e.target.value)}>
+                      <option value="일기 피드백">일기 피드백</option>
+                      <option value="감정 조절">감정 조절</option>
+                      <option value="관계 고민">관계 고민</option>
+                      <option value="육아 고민">육아 고민</option>
+                      <option value="기타">기타</option>
+                    </select>
+                  </label>
+                  <label>
+                    요청 내용
+                    <textarea
+                      value={expertRequestText}
+                      onChange={(e) => setExpertRequestText(e.target.value)}
+                      placeholder="관리자(전문가)에게 받고 싶은 조언을 구체적으로 적어주세요."
+                      rows={4}
+                    />
+                  </label>
+                  <button className="primaryBtn" onClick={submitExpertRequest}>
+                    요청 등록
+                  </button>
+                </div>
+                <div className="dayEntryList">
+                  <h3>내 요청 목록</h3>
+                  {expertRequests.length === 0 && <p className="emptyText">등록된 요청이 없습니다.</p>}
+                  {expertRequests.map((request) => (
+                    <div key={`expert-request-${request.id}`} className="dayEntryCard">
+                      <p className="summaryText">
+                        [{request.category}] 상태: {request.status === "answered" ? "답변 완료" : "답변 대기"}
+                      </p>
+                      <p>{request.requestText}</p>
+                      {request.advisorReply ? (
+                        <div className="solutionBox">
+                          <h4>관리자 조언</h4>
+                          <p>{request.advisorReply}</p>
+                        </div>
+                      ) : (
+                        <p className="summaryText">아직 관리자 조언이 등록되지 않았습니다.</p>
+                      )}
                     </div>
                   ))}
                 </div>
               </article>
 
+              {isDeveloper && (
+                <article className="panel full">
+                  <h2>개발자 모드: 작성자별 활동 분석</h2>
+                  <p className="summaryText">
+                    작성자 ID 목록에서 선택하면 해당 사용자의 활동을 날짜별로 정리해서 볼 수 있습니다.
+                  </p>
+                  <div className="authorCatalog">
+                    <div className="authorCatalogHead">
+                      <span>작성자</span>
+                      <span>UID</span>
+                      <span>일기</span>
+                      <span>육아일기</span>
+                      <span>최근 활동</span>
+                    </div>
+                    {developerAuthors.map((author) => (
+                      <button
+                        key={`catalog-${author.key}`}
+                        className={`authorCatalogRow ${developerAuthorFilter === author.key ? "active" : ""}`}
+                        onClick={() => setDeveloperAuthorFilter(author.key)}
+                      >
+                        <span>{author.label}</span>
+                        <span className="monoText">{author.uid}</span>
+                        <span>{author.diary}</span>
+                        <span>{author.child}</span>
+                        <span>{author.lastDate}</span>
+                      </button>
+                    ))}
+                  </div>
+                  <div className="authorFilterRow">
+                    <button
+                      className={`authorChip ${developerAuthorFilter === "all" ? "active" : ""}`}
+                      onClick={() => setDeveloperAuthorFilter("all")}
+                    >
+                      전체 ({journalList.length + childList.length})
+                    </button>
+                    {developerAuthors.map((author) => (
+                      <button
+                        key={author.key}
+                        className={`authorChip ${developerAuthorFilter === author.key ? "active" : ""}`}
+                        onClick={() => setDeveloperAuthorFilter(author.key)}
+                      >
+                        {author.label} ({author.diary + author.child}) · ID:{author.uid}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="developerActivityGrid">
+                    <div className="developerColumn">
+                      <h3>일기 활동 ({filteredJournalEntries.length})</h3>
+                      {groupedDiaryByDate.length === 0 && (
+                        <p className="emptyText">해당 작성자의 일기 기록이 없습니다.</p>
+                      )}
+                      {groupedDiaryByDate.map((group) => (
+                        <div key={`diary-date-${group.date}`} className="dateGroup">
+                          <h4>
+                            {group.date} ({group.items.length})
+                          </h4>
+                          {group.items.map((entry) => (
+                            <div key={`dev-diary-${entry.id}`} className="developerItem">
+                              <p className="summaryText">
+                                작성자: {entry.authorLabel || entry.uid} · ID: {entry.uid}
+                              </p>
+                              <p className="summaryText">
+                                기분 {entry.mood}/10 · 에너지 {entry.energy}/10 · 관계 {entry.relationship}/10 · 성취{" "}
+                                {entry.achievement}/10
+                              </p>
+                              <p className="summaryText">감정: {entry.emotions.join(", ") || "(선택 없음)"}</p>
+                              <p>{entry.reflection || entry.text || "(내용 없음)"}</p>
+                            </div>
+                          ))}
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="developerColumn">
+                      <h3>육아 일기 활동 ({filteredChildEntries.length})</h3>
+                      {groupedChildByDate.length === 0 && (
+                        <p className="emptyText">해당 작성자의 육아 일기 기록이 없습니다.</p>
+                      )}
+                      {groupedChildByDate.map((group) => (
+                        <div key={`child-date-${group.date}`} className="dateGroup">
+                          <h4>
+                            {group.date} ({group.items.length})
+                          </h4>
+                          {group.items.map((entry) => (
+                            <div key={`dev-child-${entry.id}`} className="developerItem">
+                              <p className="summaryText">
+                                작성자: {entry.authorLabel || entry.uid} · ID: {entry.uid}
+                              </p>
+                              <p className="summaryText">
+                                자녀: {entry.childName || "(미입력)"} · 변화 {entry.progress}/10
+                              </p>
+                              <p>
+                                <strong>상황:</strong> {entry.situation}
+                              </p>
+                              {entry.intervention && (
+                                <p>
+                                  <strong>시도:</strong> {entry.intervention}
+                                </p>
+                              )}
+                              {entry.outcome && (
+                                <p>
+                                  <strong>결과:</strong> {entry.outcome}
+                                </p>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <h3>통합 활동 타임라인 ({combinedDeveloperActivities.length})</h3>
+                  <div className="developerTimeline">
+                    {groupedCombinedByDate.length === 0 && (
+                      <p className="emptyText">표시할 활동이 없습니다.</p>
+                    )}
+                    {groupedCombinedByDate.map((group) => (
+                      <div key={`timeline-${group.date}`} className="dateGroup">
+                        <h4>
+                          {group.date} ({group.items.length})
+                        </h4>
+                        {group.items.map((activity) => (
+                          <div key={`${activity.type}-${activity.id}`} className="developerItem">
+                            <p className="summaryText">{activity.author}</p>
+                            <p className="summaryText">
+                              <span className="typeBadge">{activity.type}</span> {activity.summary}
+                            </p>
+                            <p>{activity.detail}</p>
+                          </div>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                </article>
+              )}
+
               <article className="panel">
-                <h2>최근 7일 감정 그래프</h2>
+                <h2>최근 7일 감정 추이</h2>
                 <p className="summaryText">
                   기록일 {weeklyStats.daysWithEntry}일 / 평균 점수 {weeklyStats.average ?? "-"} / 추세 {weeklyStats.trend}
                 </p>
-                <div className="weeklyChart">
-                  {weeklyPoints.map((point) => (
-                    <div key={point.date} className="barCol">
-                      <div className="barWrap">
-                        <div
-                          className={`bar ${point.score === null ? "empty" : "filled"}`}
-                          style={{ height: `${point.score ?? 8}%` }}
-                          title={
-                            point.score === null
-                              ? `${point.date}: 기록 없음`
-                              : `${point.date}: ${point.mood}/10`
-                          }
+                <div className="lineChartWrap">
+                  <svg
+                    viewBox={`0 0 ${weeklyLineMeta.width} ${weeklyLineMeta.height + 34}`}
+                    className="lineChart"
+                    role="img"
+                    aria-label="최근 7일 감정 라인 차트"
+                  >
+                    {[0, 1, 2, 3, 4].map((grid) => {
+                      const y = Math.round((weeklyLineMeta.height / 4) * grid);
+                      return (
+                        <line
+                          key={`grid-${grid}`}
+                          x1="0"
+                          x2={weeklyLineMeta.width}
+                          y1={y}
+                          y2={y}
+                          className="lineGrid"
                         />
-                      </div>
-                      <span>{point.label}</span>
-                    </div>
-                  ))}
+                      );
+                    })}
+                    {weeklyLineMeta.linePoints && (
+                      <polyline
+                        points={weeklyLineMeta.linePoints}
+                        className={`linePath ${weeklyStats.delta >= 0 ? "up" : "down"}`}
+                      />
+                    )}
+                    {weeklyPoints.map((point, index) => {
+                      const y = weeklyLineMeta.ys[index];
+                      if (y === null) return null;
+                      return (
+                        <circle
+                          key={`point-${point.date}`}
+                          cx={weeklyLineMeta.xs[index]}
+                          cy={y}
+                          r="4"
+                          className={`linePoint ${point.mood !== null && point.mood <= 3 ? "risk" : "normal"}`}
+                        />
+                      );
+                    })}
+                    {weeklyPoints.map((point, index) => (
+                      <g key={`label-${point.date}`}>
+                        <text x={weeklyLineMeta.xs[index]} y={weeklyLineMeta.height + 22} className="lineLabel">
+                          {point.label}
+                        </text>
+                        {point.hasMedication && (
+                          <circle cx={weeklyLineMeta.xs[index]} cy={weeklyLineMeta.height + 30} r="2.6" className="medLineDot" />
+                        )}
+                      </g>
+                    ))}
+                  </svg>
+                </div>
+                <div className="insightGrid">
+                  <div className="insightChip">연속 기록 {diaryInsights.streak}일</div>
+                  <div className="insightChip">이번 달 가장 힘들었던 날: {diaryInsights.toughestDay}</div>
+                  <div className="insightChip">이번 달 가장 안정적이었던 날: {diaryInsights.strongestDay}</div>
                 </div>
               </article>
 
               <article className="panel">
-                <h2>주간 AI 분석</h2>
-                <button className="primaryBtn" onClick={analyzeWeeklyWithAi} disabled={analyzing}>
-                  {analyzing ? "분석 중" : "최근 7일 일기 분석하기"}
-                </button>
-                <pre className="analysisBox">{weeklyAiSummary || "아직 분석 결과가 없습니다."}</pre>
+                <div className="analysisHeadRow">
+                  <h2>AI 분석</h2>
+                  <button className="ghostBtn" onClick={() => setAnalysisPanelOpen((prev) => !prev)}>
+                    {analysisPanelOpen ? "접기" : "열기"}
+                  </button>
+                </div>
+                {!analysisPanelOpen && (
+                  <p className="summaryText">분석이 필요할 때만 열어서 기간을 설정하고 실행할 수 있습니다.</p>
+                )}
+                {analysisPanelOpen && (
+                  <>
+                    <div className="techniqueCard">
+                      <label htmlFor="diary-technique-select">일기 분석 상담기법 선택</label>
+                      <select
+                        id="diary-technique-select"
+                        value={selectedTechniqueForAnalysis}
+                        onChange={(e) => setSelectedTechniqueForAnalysis(e.target.value as TechniqueId)}
+                      >
+                        {techniques.map((technique) => (
+                          <option key={technique.id} value={technique.id}>
+                            {technique.title}
+                          </option>
+                        ))}
+                      </select>
+                      <p>{currentDiaryTechnique.description}</p>
+                    </div>
+                    <div className="analysisRangeCard">
+                      <label htmlFor="diary-analysis-range">분석 기간</label>
+                      <select
+                        id="diary-analysis-range"
+                        value={diaryAnalysisRange}
+                        onChange={(e) =>
+                          setDiaryAnalysisRange(e.target.value as "weekly" | "monthly" | "custom")
+                        }
+                      >
+                        <option value="weekly">주간 (기본)</option>
+                        <option value="monthly">월간 (달력 선택 월)</option>
+                        <option value="custom">기간 직접 설정</option>
+                      </select>
+                      {diaryAnalysisRange === "custom" && (
+                        <div className="analysisRangeInputs">
+                          <label>
+                            시작일
+                            <input
+                              type="date"
+                              value={diaryAnalysisStartDate}
+                              onChange={(e) => setDiaryAnalysisStartDate(e.target.value)}
+                            />
+                          </label>
+                          <label>
+                            종료일
+                            <input
+                              type="date"
+                              value={diaryAnalysisEndDate}
+                              onChange={(e) => setDiaryAnalysisEndDate(e.target.value)}
+                            />
+                          </label>
+                        </div>
+                      )}
+                      <p className="summaryText">
+                        선택 범위: {diaryAnalysisBounds.start} ~ {diaryAnalysisBounds.end} / 기록 {diaryAnalysisEntries.length}건
+                      </p>
+                    </div>
+                    <button className="primaryBtn" onClick={analyzeDiaryWithAi} disabled={analyzing}>
+                      {analyzing ? "분석 중" : `${diaryAnalysisRangeLabel} 일기 분석하기`}
+                    </button>
+                    {weeklyAnalysisCards.length > 0 && (
+                      <div className="analysisCards">
+                        {weeklyAnalysisCards.map((card) => (
+                          <div key={card.title} className="analysisCard">
+                            <h3>{card.title}</h3>
+                            <p>{card.body}</p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <div className="fortuneWeeklyCard">
+                      <h3>조언 vs 실제 기록 리포트 (최근 7일)</h3>
+                      <p>{weeklyFortuneReport}</p>
+                    </div>
+                    {medicationPatternSummary && (
+                      <div className="fortuneWeeklyCard">
+                        <h3>투약 패턴 요약</h3>
+                        <p>{medicationPatternSummary}</p>
+                      </div>
+                    )}
+                    <pre className="analysisBox">{weeklyAiSummary || "아직 분석 결과가 없습니다."}</pre>
+                  </>
+                )}
               </article>
 
-              <article className="panel full">
-                <h2>개발자 분석 데이터(JSON)</h2>
-                <p className="summaryText">
-                  개발자는 이 JSON 구조를 그대로 수집해서 외부 분석 파이프라인으로 넘길 수 있습니다.
-                </p>
-                <pre className="jsonBox">{JSON.stringify(developerPayload, null, 2)}</pre>
-              </article>
             </section>
           )}
 
@@ -1720,8 +4375,24 @@ export default function Page() {
               </article>
 
               <article className="panel">
-                <h2>자녀 상담 워크스페이스</h2>
+                <h2>육아 일기 워크스페이스</h2>
                 <div className="diaryForm">
+                  <div className="techniqueCard">
+                    <label htmlFor="child-technique-select">육아 일기 AI 도움 방식</label>
+                    <select
+                      id="child-technique-select"
+                      value={childTechnique}
+                      onChange={(e) => setChildTechnique(e.target.value as TechniqueId)}
+                    >
+                      {techniques.map((technique) => (
+                        <option key={technique.id} value={technique.id}>
+                          {technique.title}
+                        </option>
+                      ))}
+                    </select>
+                    <p>{currentChildTechnique.description}</p>
+                  </div>
+
                   <label>
                     날짜
                     <input type="date" value={childDate} onChange={(e) => setChildDate(e.target.value)} />
@@ -1783,9 +4454,96 @@ export default function Page() {
                   <pre className="analysisBox">{childAiSolution || "아직 생성된 솔루션이 없습니다."}</pre>
 
                   <button className="primaryBtn" onClick={saveChildEntry}>
-                    자녀 상담 기록 저장
+                    {editingChildId ? "육아 일기 수정 저장" : "육아 일기 저장"}
                   </button>
+                  {editingChildId && (
+                    <button className="ghostBtn" onClick={cancelChildEdit}>
+                      수정 취소
+                    </button>
+                  )}
                   {childSaveStatus && <p className="statusText">{childSaveStatus}</p>}
+                </div>
+              </article>
+
+              <article className="panel">
+                <h2>육아 일기 달력</h2>
+                <div className="calendarHead">
+                  <button
+                    className="ghostBtn"
+                    onClick={() =>
+                      setChildAnalysisMonth(
+                        (prev) => new Date(prev.getFullYear(), prev.getMonth() - 1, 1)
+                      )
+                    }
+                  >
+                    이전 달
+                  </button>
+                  <strong>
+                    {childAnalysisMonth.getFullYear()}년 {childAnalysisMonth.getMonth() + 1}월
+                  </strong>
+                  <button
+                    className="ghostBtn"
+                    onClick={() =>
+                      setChildAnalysisMonth(
+                        (prev) => new Date(prev.getFullYear(), prev.getMonth() + 1, 1)
+                      )
+                    }
+                  >
+                    다음 달
+                  </button>
+                </div>
+                <div className="calendarWeekdays">
+                  {["일", "월", "화", "수", "목", "금", "토"].map((day) => (
+                    <span key={`child-week-${day}`}>{day}</span>
+                  ))}
+                </div>
+                <div className="calendarGrid">
+                  {childMonthDays.map((cell, idx) => {
+                    if (!cell.date) {
+                      return <div key={`child-empty-${idx}`} className="calendarCell empty" />;
+                    }
+                    return (
+                      <button
+                        key={`child-day-${cell.date}`}
+                        type="button"
+                        className={`calendarCell ${cell.hasEntry ? "done" : "todo"} ${
+                          cell.isFuture ? "future" : ""
+                        } ${cell.hasEntry ? `heat-${cell.heatTone}` : ""}`}
+                        onClick={() => setChildDate(cell.date)}
+                      >
+                        <strong>{cell.day}</strong>
+                        <span>{cell.isFuture ? "-" : cell.hasEntry ? "작성" : "미작성"}</span>
+                        {cell.hasEntry && <em>{cell.avgScore}/10</em>}
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="summaryText">달력 날짜를 누르면 해당 날짜의 육아 일기를 바로 볼 수 있습니다.</p>
+                <div className="dayEntryList">
+                  <h3>{childDate} 작성 육아 일기</h3>
+                  {selectedChildEntries.length === 0 && (
+                    <p className="emptyText">선택한 날짜에 작성한 육아 일기가 없습니다.</p>
+                  )}
+                  {selectedChildEntries.map((entry) => (
+                    <div key={`day-child-${entry.id}`} className="dayEntryCard">
+                      <p className="summaryText">
+                        자녀: {entry.childName || "(미입력)"} · 변화 점수 {entry.progress}/10
+                      </p>
+                      <p>
+                        <strong>상황:</strong> {entry.situation}
+                      </p>
+                      {entry.intervention && (
+                        <p>
+                          <strong>시도:</strong> {entry.intervention}
+                        </p>
+                      )}
+                      {entry.outcome && (
+                        <p>
+                          <strong>결과:</strong> {entry.outcome}
+                        </p>
+                      )}
+                    </div>
+                  ))}
                 </div>
               </article>
 
@@ -1816,9 +4574,55 @@ export default function Page() {
               </article>
 
               <article className="panel full">
-                <h2>자녀 상담 기록</h2>
+                <h2>아이 변화 타임라인</h2>
+                <p className="summaryText">
+                  과거부터 현재까지 변화 흐름과 지도 솔루션을 날짜 순으로 확인할 수 있습니다.
+                </p>
+                <div className="childTimeline">
+                  {childTimelineEntries.length === 0 && (
+                    <p className="emptyText">아직 타임라인에 표시할 육아 일기 기록이 없습니다.</p>
+                  )}
+                  {childTimelineEntries.map((entry) => {
+                    const tags = childSignalTags(entry);
+                    return (
+                      <div key={`timeline-${entry.id}`} className="timelineRow">
+                        <div className="timelineDate">
+                          <strong>{entry.date}</strong>
+                          <span>{entry.childName || "자녀 이름 미입력"}</span>
+                        </div>
+                        <div className="timelineBody">
+                          <div className="signalRow">
+                            {tags.map((tag, idx) => (
+                              <span key={`${entry.id}-tag-${idx}`} className={`signalBadge ${tag.tone}`}>
+                                {tag.label}
+                              </span>
+                            ))}
+                          </div>
+                          <p>
+                            <strong>상황:</strong> {renderHighlightedText(entry.situation)}
+                          </p>
+                          <p>
+                            <strong>시도:</strong> {renderHighlightedText(entry.intervention)}
+                          </p>
+                          <p>
+                            <strong>결과:</strong> {renderHighlightedText(entry.outcome)}
+                          </p>
+                          <p className="summaryText">변화 점수: {entry.progress}/10</p>
+                          <div className="solutionBox">
+                            <h4>AI 지도 솔루션</h4>
+                            <p>{entry.aiSolution.trim() || "아직 지도 솔루션이 없습니다."}</p>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </article>
+
+              <article className="panel full">
+                <h2>육아 일기 기록</h2>
                 <div className="journalList">
-                  {latestChildEntries.length === 0 && <p className="emptyText">저장된 자녀 상담 기록이 없습니다.</p>}
+                  {latestChildEntries.length === 0 && <p className="emptyText">저장된 육아 일기 기록이 없습니다.</p>}
                   {latestChildEntries.map((entry) => (
                     <div key={entry.id} className="journalCard">
                       <div className="journalMeta">
@@ -1827,6 +4631,7 @@ export default function Page() {
                         </strong>
                         <span>변화 {entry.progress}/10</span>
                       </div>
+                      {isDeveloper && <p className="summaryText">작성자: {entry.authorLabel || entry.uid}</p>}
                       <p>
                         <strong>상황:</strong> {entry.situation}
                       </p>
@@ -1845,8 +4650,168 @@ export default function Page() {
                           <strong>AI 솔루션:</strong> {entry.aiSolution}
                         </p>
                       )}
+                      <div className="cardActions">
+                        <button className="ghostBtn" onClick={() => editChildEntry(entry)}>
+                          수정
+                        </button>
+                        <button className="ghostBtn dangerBtn" onClick={() => deleteChildEntry(entry)}>
+                          삭제
+                        </button>
+                      </div>
                     </div>
                   ))}
+                </div>
+              </article>
+
+              {isDeveloper && (
+                <article className="panel full">
+                  <h2>개발자 모드: 작성자별 육아 일기 빠른 보기</h2>
+                  <p className="summaryText">
+                    같은 작성자 필터를 적용해 육아 일기 활동만 빠르게 확인할 수 있습니다.
+                  </p>
+                  <div className="authorFilterRow">
+                    <button
+                      className={`authorChip ${developerAuthorFilter === "all" ? "active" : ""}`}
+                      onClick={() => setDeveloperAuthorFilter("all")}
+                    >
+                      전체 ({childList.length})
+                    </button>
+                    {developerAuthors
+                      .filter((author) => author.child > 0)
+                      .map((author) => (
+                        <button
+                          key={`child-author-${author.key}`}
+                          className={`authorChip ${developerAuthorFilter === author.key ? "active" : ""}`}
+                          onClick={() => setDeveloperAuthorFilter(author.key)}
+                        >
+                          {author.label} ({author.child}) · ID:{author.uid}
+                        </button>
+                      ))}
+                  </div>
+                  <div className="developerTimeline">
+                    {groupedChildByDate.length === 0 && (
+                      <p className="emptyText">표시할 육아 일기 활동이 없습니다.</p>
+                    )}
+                    {groupedChildByDate.map((group) => (
+                      <div key={`quick-child-${group.date}`} className="dateGroup">
+                        <h4>
+                          {group.date} ({group.items.length})
+                        </h4>
+                        {group.items.map((entry) => (
+                          <div key={`child-quick-${entry.id}`} className="developerItem">
+                            <p className="summaryText">
+                              작성자: {entry.authorLabel || entry.uid} · ID: {entry.uid}
+                            </p>
+                            <p className="summaryText">
+                              <span className="typeBadge">육아일기</span> {entry.childName || "(자녀 미입력)"} · 변화{" "}
+                              {entry.progress}/10
+                            </p>
+                            <p>
+                              <strong>상황:</strong> {entry.situation}
+                            </p>
+                            {entry.intervention && (
+                              <p>
+                                <strong>시도:</strong> {entry.intervention}
+                              </p>
+                            )}
+                            {entry.outcome && (
+                              <p>
+                                <strong>결과:</strong> {entry.outcome}
+                              </p>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                </article>
+              )}
+            </section>
+          )}
+
+          {activeTab === "admin" && isDeveloper && (
+            <section className="testLayout">
+              <article className="panel full">
+                <h2>관리자 페이지</h2>
+                <p className="summaryText">
+                  동의한 이용자의 계정 정보와 삭제 요청을 관리할 수 있습니다. 비밀번호는 Firebase 보안 정책상 조회할 수 없습니다.
+                </p>
+                <div className="adminGrid">
+                  <div className="adminCard">
+                    <h3>동의 사용자 목록 ({adminUsers.length})</h3>
+                    {adminUsers.length === 0 && <p className="emptyText">동의한 사용자가 없습니다.</p>}
+                    {adminUsers.map((profile) => (
+                      <div key={`admin-user-${profile.uid}`} className="developerItem">
+                        <p className="summaryText">
+                          <strong>{profile.nickname || "(이름 없음)"}</strong> · {profile.accountId || "(아이디 없음)"}
+                        </p>
+                        <p className="summaryText monoText">UID: {profile.uid}</p>
+                        <p className="summaryText">연락처: {profile.contact || "(미입력)"}</p>
+                        <p className="summaryText">
+                          계정 상태: {profile.disabled ? "삭제 처리됨(로그인 차단)" : "사용 중"}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="adminCard">
+                    <h3>계정 삭제 요청 ({deleteRequests.length})</h3>
+                    {deleteRequests.length === 0 && <p className="emptyText">삭제 요청이 없습니다.</p>}
+                    {deleteRequests.map((req) => (
+                      <div key={`delete-req-${req.uid}`} className="developerItem">
+                        <p className="summaryText">
+                          <strong>{req.nickname || "(이름 없음)"}</strong> · {req.accountId || "(아이디 없음)"}
+                        </p>
+                        <p className="summaryText monoText">UID: {req.uid}</p>
+                        <p className="summaryText">사유: {req.reason || "(사유 없음)"}</p>
+                        <p className="summaryText">상태: {req.status === "pending" ? "대기" : "처리 완료"}</p>
+                        {req.status === "pending" && (
+                          <button
+                            className="ghostBtn dangerBtn"
+                            onClick={() => processDeleteRequest(req.uid)}
+                            disabled={deletingUid === req.uid}
+                          >
+                            {deletingUid === req.uid ? "처리 중..." : "삭제 요청 처리"}
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="adminCard">
+                    <h3>전문가 요청 관리 ({expertRequests.length})</h3>
+                    {expertRequests.length === 0 && <p className="emptyText">등록된 전문가 요청이 없습니다.</p>}
+                    {expertRequests.map((request) => (
+                      <div key={`admin-expert-${request.id}`} className="developerItem">
+                        <p className="summaryText">
+                          <strong>{request.authorLabel || request.uid}</strong> · [{request.category}] ·{" "}
+                          {request.status === "answered" ? "답변 완료" : "답변 대기"}
+                        </p>
+                        <p className="summaryText monoText">UID: {request.uid || "-"}</p>
+                        <p>{request.requestText}</p>
+                        {request.advisorReply && (
+                          <div className="solutionBox">
+                            <h4>등록된 조언</h4>
+                            <p>{request.advisorReply}</p>
+                          </div>
+                        )}
+                        <label>
+                          관리자 조언
+                          <textarea
+                            value={replyDrafts[request.id] ?? ""}
+                            onChange={(e) =>
+                              setReplyDrafts((prev) => ({ ...prev, [request.id]: e.target.value }))
+                            }
+                            placeholder="요청자에게 전달할 조언을 입력하세요."
+                            rows={3}
+                          />
+                        </label>
+                        <button className="ghostBtn" onClick={() => saveExpertReply(request)}>
+                          조언 저장
+                        </button>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </article>
             </section>
@@ -1988,7 +4953,7 @@ export default function Page() {
             <pre className="analysisBox resultSummary">{testResult}</pre>
             <div className="expertActions">
               <button className="primaryBtn" onClick={connectExpertFromTest}>
-                전문가 연결하기
+                상담 워크스페이스로 가져오기
               </button>
               <a
                 className="ghostBtn linkBtn"
@@ -2110,6 +5075,23 @@ export default function Page() {
           cursor: not-allowed;
         }
 
+        .signupPanel {
+          border: 1px solid #ecd7c8;
+          border-radius: 12px;
+          background: #fff8f1;
+          padding: 10px;
+          display: grid;
+          gap: 8px;
+        }
+
+        .consentRow {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          font-size: 0.84rem;
+          color: #6e5448;
+        }
+
         .authDivider {
           margin-top: 12px;
           font-size: 0.82rem;
@@ -2173,6 +5155,16 @@ export default function Page() {
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
+        }
+
+        .userBar input {
+          flex: 1;
+          min-width: 180px;
+          border: 1px solid #e7d5c7;
+          border-radius: 10px;
+          padding: 8px 10px;
+          background: #fffdfb;
+          color: #4a372f;
         }
 
         .userBar button {
@@ -2280,14 +5272,30 @@ export default function Page() {
         }
 
         .composerCard {
-          max-width: 1100px;
-          margin: 14px auto 0;
           background: linear-gradient(180deg, #fffdfa 0%, #fff8f2 100%);
           border: 1px solid #f1ddcf;
           border-radius: 24px;
           padding: 16px;
           box-shadow: 0 12px 34px rgba(135, 97, 73, 0.12);
           animation: rise 0.55s ease-out;
+        }
+
+        .counselWorkspace {
+          max-width: 1100px;
+          margin: 14px auto 0;
+          display: grid;
+          grid-template-columns: 280px 1fr;
+          gap: 14px;
+          align-items: start;
+        }
+
+        .counselWorkspace.guest {
+          grid-template-columns: 1fr;
+        }
+
+        .threadSidebar {
+          position: sticky;
+          top: 12px;
         }
 
         .chatSurface {
@@ -2348,6 +5356,96 @@ export default function Page() {
           padding-top: 12px;
         }
 
+        .threadPanel {
+          border: 1px solid #efdacc;
+          border-radius: 14px;
+          background: #fffaf5;
+          padding: 10px;
+          display: grid;
+          gap: 8px;
+        }
+
+        .threadPanelHead {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+        }
+
+        .threadPanelHead strong {
+          color: #62483c;
+          font-size: 0.9rem;
+        }
+
+        .threadList {
+          display: grid;
+          gap: 6px;
+          max-height: 180px;
+          overflow-y: auto;
+        }
+
+        .threadItem {
+          border: 1px solid #ead6c8;
+          border-radius: 10px;
+          background: #fffdfb;
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 8px;
+          padding: 6px;
+        }
+
+        .threadItem.active {
+          background: #ffe8d6;
+          border-color: #f1c6a8;
+        }
+
+        .threadSelectBtn {
+          border: 0;
+          background: transparent;
+          color: #6d5247;
+          text-align: left;
+          padding: 4px;
+          display: grid;
+          gap: 2px;
+          min-width: 0;
+          flex: 1;
+          cursor: pointer;
+        }
+
+        .threadSelectBtn strong {
+          font-size: 0.86rem;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+
+        .threadSelectBtn span {
+          font-size: 0.74rem;
+          color: #8a6a5a;
+          font-family: "Fira Mono", var(--font-geist-mono), monospace;
+        }
+
+        .threadDeleteBtn {
+          border: 1px solid #efc5ba;
+          background: #fdece8;
+          color: #973f37;
+          border-radius: 8px;
+          padding: 5px 7px;
+          font-size: 0.74rem;
+          font-weight: 700;
+          cursor: pointer;
+          flex-shrink: 0;
+        }
+
+        .chatSendRow {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 10px;
+          flex-wrap: wrap;
+        }
+
         .chatViewport {
           max-height: 500px;
           min-height: 280px;
@@ -2390,6 +5488,48 @@ export default function Page() {
           margin: 0;
           font-size: 0.86rem;
           color: #785d50;
+        }
+
+        .analysisHeadRow {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 8px;
+          margin-bottom: 8px;
+        }
+
+        .analysisRangeCard {
+          margin-top: 10px;
+          border: 1px solid #edd8c9;
+          border-radius: 14px;
+          padding: 10px 12px;
+          background: #fff8f1;
+          display: grid;
+          gap: 6px;
+        }
+
+        .analysisRangeCard label {
+          display: grid;
+          gap: 6px;
+          font-size: 0.86rem;
+          color: #6f5348;
+          font-weight: 700;
+        }
+
+        .analysisRangeCard select,
+        .analysisRangeCard input {
+          border: 1px solid #e7d5c7;
+          border-radius: 10px;
+          padding: 9px 10px;
+          background: #fffdfb;
+          color: #4a372f;
+        }
+
+        .analysisRangeInputs {
+          margin-top: 6px;
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 8px;
         }
 
         .intakeCard {
@@ -2554,6 +5694,7 @@ export default function Page() {
           margin: 18px auto 0;
           display: grid;
           grid-template-columns: 1fr 1fr;
+          align-items: start;
           gap: 14px;
           animation: rise 0.75s ease-out;
         }
@@ -2574,6 +5715,47 @@ export default function Page() {
           grid-template-columns: 1fr;
           gap: 14px;
           animation: rise 0.75s ease-out;
+        }
+
+        .adminGrid {
+          margin-top: 10px;
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 10px;
+        }
+
+        .adminCard {
+          border: 1px solid #ecd9cb;
+          border-radius: 14px;
+          background: #fffdfb;
+          padding: 10px;
+          display: grid;
+          gap: 8px;
+          max-height: 520px;
+          overflow-y: auto;
+        }
+
+        .adminCard h3 {
+          margin: 0;
+          color: #62473c;
+          font-size: 0.94rem;
+        }
+
+        .adminCard label {
+          display: grid;
+          gap: 6px;
+          font-size: 0.82rem;
+          color: #6d5348;
+        }
+
+        .adminCard textarea {
+          width: 100%;
+          border: 1px solid #e8d5c8;
+          border-radius: 10px;
+          padding: 8px 10px;
+          background: #fffdfb;
+          color: #4a372f;
+          font-size: 0.84rem;
         }
 
         .panel {
@@ -2683,6 +5865,566 @@ export default function Page() {
           gap: 10px;
         }
 
+        .modePicker {
+          border: 1px solid #ead7ca;
+          border-radius: 12px;
+          background: #fff9f4;
+          padding: 10px;
+          display: grid;
+          gap: 8px;
+        }
+
+        .fortuneCard {
+          border: 1px solid #edd3bf;
+          border-radius: 14px;
+          background: linear-gradient(180deg, #fff8ef 0%, #fff2e5 100%);
+          padding: 10px;
+          display: grid;
+          gap: 8px;
+        }
+
+        .fortuneCard h3 {
+          margin: 0;
+          color: #724d3a;
+          font-size: 0.92rem;
+        }
+
+        .fortuneCard p {
+          margin: 0;
+          color: #6c4e41;
+          font-size: 0.84rem;
+          line-height: 1.45;
+        }
+
+        .fortuneMission {
+          border: 1px dashed #e7c2a6;
+          border-radius: 10px;
+          background: #fff8f2;
+          padding: 8px 9px;
+        }
+
+        .fortuneMission strong {
+          color: #6d4835;
+          font-size: 0.82rem;
+        }
+
+        .medCard {
+          border: 1px solid #ead7ca;
+          border-radius: 14px;
+          background: #fffdfb;
+          padding: 10px;
+          display: grid;
+          gap: 8px;
+        }
+
+        .healthTopRow {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 8px;
+        }
+
+        .healthAddRow {
+          border: 1px dashed #ebd5c6;
+          border-radius: 10px;
+          background: #fffaf6;
+          padding: 8px 10px;
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: 8px;
+        }
+
+        .medCard h3 {
+          margin: 0;
+          color: #66493d;
+          font-size: 0.9rem;
+        }
+
+        .medHead {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 8px;
+        }
+
+        .medCard select,
+        .medCard input {
+          border: 1px solid #e8d5c8;
+          border-radius: 10px;
+          padding: 9px 10px;
+          background: #fffdfb;
+          color: #4a372f;
+          font-size: 0.85rem;
+        }
+
+        .timeChipRow {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: 8px;
+        }
+
+        .healthModalOverlay {
+          position: fixed;
+          inset: 0;
+          z-index: 80;
+          background: rgba(36, 22, 14, 0.5);
+          display: grid;
+          place-items: center;
+          padding: 14px;
+        }
+
+        .healthModalSheet {
+          width: min(520px, 100%);
+          border: 1px solid #ead7c8;
+          border-radius: 16px;
+          background: #fffaf6;
+          padding: 14px;
+          display: grid;
+          gap: 10px;
+        }
+
+        .healthModalSheet h3 {
+          margin: 0;
+          color: #65483d;
+          font-size: 1rem;
+        }
+
+        .healthConsentBox {
+          border: 1px dashed #e6cab8;
+          border-radius: 10px;
+          background: #fff6ef;
+          padding: 8px 9px;
+        }
+
+        .healthConsentBox p {
+          margin: 0 0 6px;
+          color: #704f41;
+          font-size: 0.82rem;
+          line-height: 1.4;
+        }
+
+        .medDot {
+          width: 6px;
+          height: 6px;
+          border-radius: 50%;
+          background: #7fa05e;
+          margin-top: 2px;
+        }
+
+        .medLineDot {
+          fill: #7fa05e;
+        }
+
+        .modeGrid {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+        }
+
+        .modeChip {
+          border: 1px solid #e5cdbd;
+          background: #fffdfb;
+          color: #6a4f43;
+          border-radius: 999px;
+          padding: 7px 11px;
+          font-size: 0.82rem;
+          cursor: pointer;
+        }
+
+        .modeChip.active {
+          background: #ffdec7;
+          border-color: #f1b790;
+          color: #55382b;
+          font-weight: 700;
+        }
+
+        .modeGuideCard {
+          border: 1px solid #ebd7c8;
+          border-radius: 12px;
+          background: #fffdfb;
+          padding: 10px;
+          display: grid;
+          gap: 8px;
+        }
+
+        .modeGuideCard h3 {
+          margin: 0;
+          color: #66493d;
+          font-size: 0.9rem;
+        }
+
+        .modeGuideCard p {
+          margin: 0;
+          color: #785d50;
+          font-size: 0.82rem;
+          line-height: 1.4;
+        }
+
+        .guideSteps {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+        }
+
+        .guideSteps span {
+          border: 1px solid #edd8ca;
+          background: #fff7f1;
+          color: #6f5549;
+          border-radius: 999px;
+          padding: 4px 8px;
+          font-size: 0.76rem;
+        }
+
+        .modeFieldGrid {
+          display: grid;
+          gap: 8px;
+        }
+
+        .modeFieldGrid textarea {
+          width: 100%;
+          border: 1px solid #e8d5c8;
+          border-radius: 10px;
+          padding: 8px 10px;
+          background: #fffdfb;
+          color: #4a372f;
+          font-size: 0.85rem;
+          resize: vertical;
+        }
+
+        .emotionPicker {
+          display: grid;
+          gap: 8px;
+          font-size: 0.88rem;
+          color: #6d5348;
+        }
+
+        .emotionGrid {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+        }
+
+        .emotionChip {
+          border: 1px solid #e6cfbf;
+          background: #fff9f3;
+          color: #6f5549;
+          border-radius: 999px;
+          padding: 7px 11px;
+          font-size: 0.84rem;
+          cursor: pointer;
+        }
+
+        .emotionChip.active {
+          background: #ffd9c1;
+          border-color: #f1b790;
+          color: #573b2e;
+          font-weight: 700;
+        }
+
+        .liveSummary {
+          margin: 2px 0 0;
+          border: 1px dashed #ebccb6;
+          border-radius: 10px;
+          background: #fff5ec;
+          color: #6a4b3d;
+          font-size: 0.83rem;
+          line-height: 1.4;
+          padding: 8px 10px;
+        }
+
+        .textMetaRow {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 8px;
+          font-size: 0.82rem;
+          color: #785d50;
+        }
+
+        .textMetaRow button:disabled {
+          opacity: 0.55;
+          cursor: not-allowed;
+        }
+
+        .keySentenceBox {
+          border: 1px solid #eed6c6;
+          border-radius: 12px;
+          background: #fffaf6;
+          padding: 9px 10px;
+        }
+
+        .keySentenceBox strong {
+          display: block;
+          color: #6a4a3d;
+          font-size: 0.84rem;
+        }
+
+        .keySentenceBox p {
+          margin: 4px 0 0;
+          color: #7a5c4f;
+          font-size: 0.84rem;
+        }
+
+        .checkRow {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          font-size: 0.84rem;
+          color: #6e5448;
+        }
+
+        .checkRow input {
+          width: 16px;
+          height: 16px;
+        }
+
+        .liveComment {
+          margin: 0;
+          border: 1px solid #f0c9ac;
+          border-radius: 10px;
+          background: #ffeede;
+          color: #6d4736;
+          font-size: 0.84rem;
+          line-height: 1.45;
+          padding: 8px 10px;
+        }
+
+        .diaryDashboard {
+          margin-top: 12px;
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 10px;
+        }
+
+        .metricCard {
+          border: 1px solid #ecd8ca;
+          border-radius: 14px;
+          background: #fffaf6;
+          padding: 10px;
+          display: grid;
+          gap: 8px;
+        }
+
+        .metricCard h3 {
+          margin: 0;
+          color: #66493d;
+          font-size: 0.9rem;
+        }
+
+        .gaugeWrap {
+          position: relative;
+          width: 140px;
+          height: 140px;
+          margin: 0 auto;
+        }
+
+        .gaugeSvg {
+          width: 140px;
+          height: 140px;
+          transform: rotate(-90deg);
+        }
+
+        .gaugeTrack {
+          fill: none;
+          stroke: #f1ded1;
+          stroke-width: 10;
+        }
+
+        .gaugeValue {
+          fill: none;
+          stroke: #ea8f72;
+          stroke-width: 10;
+          stroke-linecap: round;
+        }
+
+        .gaugeCenter {
+          position: absolute;
+          inset: 0;
+          display: grid;
+          place-content: center;
+          text-align: center;
+          color: #6a4a3e;
+        }
+
+        .gaugeCenter strong {
+          font-size: 1.4rem;
+          line-height: 1;
+        }
+
+        .gaugeCenter span {
+          font-size: 0.8rem;
+        }
+
+        .donutWrap {
+          display: grid;
+          grid-template-columns: 110px 1fr;
+          gap: 10px;
+          align-items: center;
+        }
+
+        .donutChart {
+          width: 110px;
+          height: 110px;
+          border-radius: 50%;
+          border: 1px solid #ead4c4;
+          position: relative;
+        }
+
+        .donutChart::after {
+          content: "";
+          position: absolute;
+          inset: 23px;
+          border-radius: 50%;
+          background: #fffaf6;
+          border: 1px solid #f0dfd1;
+        }
+
+        .donutLegend {
+          display: grid;
+          gap: 5px;
+        }
+
+        .donutLegend p {
+          margin: 0;
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          font-size: 0.82rem;
+          color: #6e5448;
+        }
+
+        .legendDot {
+          width: 10px;
+          height: 10px;
+          border-radius: 50%;
+        }
+
+        .calendarHead {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+          margin-bottom: 10px;
+        }
+
+        .calendarHead strong {
+          color: #66493d;
+        }
+
+        .calendarWeekdays {
+          display: grid;
+          grid-template-columns: repeat(7, minmax(0, 1fr));
+          gap: 6px;
+          margin-bottom: 6px;
+          color: #7b6155;
+          font-size: 0.8rem;
+          text-align: center;
+        }
+
+        .calendarGrid {
+          display: grid;
+          grid-template-columns: repeat(7, minmax(0, 1fr));
+          gap: 6px;
+        }
+
+        .calendarCell {
+          border: 1px solid #ecd8cb;
+          border-radius: 10px;
+          min-height: 64px;
+          background: #fffdfb;
+          color: #6e5449;
+          display: grid;
+          align-content: center;
+          justify-items: center;
+          font-size: 0.78rem;
+          padding: 6px 4px;
+          cursor: pointer;
+        }
+
+        .calendarCell.empty {
+          border: 0;
+          background: transparent;
+          cursor: default;
+        }
+
+        .calendarCell strong {
+          font-size: 0.9rem;
+        }
+
+        .calendarCell em {
+          font-style: normal;
+          font-size: 0.7rem;
+          color: #7a6054;
+        }
+
+        .calendarCell.done {
+          background: #ffe9d8;
+          border-color: #f2c7a8;
+        }
+
+        .calendarCell.heat-good {
+          background: #e9f6ea;
+          border-color: #b9dfbd;
+        }
+
+        .calendarCell.heat-mid {
+          background: #fff6dc;
+          border-color: #ebd397;
+        }
+
+        .calendarCell.heat-low {
+          background: #fdeceb;
+          border-color: #efc2bd;
+        }
+
+        .calendarCell.todo {
+          background: #fffdfb;
+        }
+
+        .calendarCell.future {
+          opacity: 0.58;
+        }
+
+        .heatLegend {
+          margin-top: 8px;
+          display: flex;
+          gap: 10px;
+          flex-wrap: wrap;
+          font-size: 0.76rem;
+          color: #6f5448;
+        }
+
+        .heatLegend span {
+          display: inline-flex;
+          align-items: center;
+          gap: 5px;
+        }
+
+        .legendSwatch {
+          width: 12px;
+          height: 12px;
+          border-radius: 3px;
+          display: inline-block;
+          border: 1px solid transparent;
+        }
+
+        .legendSwatch.heat-good {
+          background: #e9f6ea;
+          border-color: #b9dfbd;
+        }
+
+        .legendSwatch.heat-mid {
+          background: #fff6dc;
+          border-color: #ebd397;
+        }
+
+        .legendSwatch.heat-low {
+          background: #fdeceb;
+          border-color: #efc2bd;
+        }
+
         .diaryForm label {
           display: grid;
           gap: 6px;
@@ -2705,6 +6447,61 @@ export default function Page() {
           overflow-y: auto;
         }
 
+        .dayEntryList {
+          margin-top: 10px;
+          display: grid;
+          gap: 8px;
+          max-height: 220px;
+          overflow-y: auto;
+        }
+
+        .dayEntryList h3 {
+          margin: 0;
+          color: #66493d;
+          font-size: 0.9rem;
+        }
+
+        .panelHeadRow {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 8px;
+        }
+
+        .quickTrendRow {
+          margin-top: 8px;
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+        }
+
+        .quickTrendRow span {
+          border: 1px solid #ecd8cb;
+          border-radius: 999px;
+          background: #fff8f1;
+          color: #6f5448;
+          padding: 4px 8px;
+          font-size: 0.78rem;
+          font-weight: 700;
+        }
+
+        .diaryWriterPanel {
+          max-height: 82vh;
+          overflow-y: auto;
+        }
+
+        .diaryCalendarPanel {
+          max-height: 82vh;
+          overflow-y: auto;
+        }
+
+        .dayEntryCard {
+          border: 1px solid #edd9cc;
+          border-radius: 10px;
+          background: #fffaf6;
+          padding: 8px 10px;
+        }
+
         .journalCard {
           border: 1px solid #efdacc;
           border-radius: 14px;
@@ -2712,11 +6509,250 @@ export default function Page() {
           background: #fff9f4;
         }
 
+        .cardActions {
+          margin-top: 8px;
+          display: flex;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+
+        .authorFilterRow {
+          margin-top: 10px;
+          display: flex;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+
+        .authorCatalog {
+          margin-top: 10px;
+          border: 1px solid #ead7c9;
+          border-radius: 12px;
+          overflow: hidden;
+          background: #fffdfb;
+        }
+
+        .authorCatalogHead,
+        .authorCatalogRow {
+          display: grid;
+          grid-template-columns: 1.2fr 1.5fr 0.5fr 0.7fr 0.8fr;
+          gap: 8px;
+          align-items: center;
+          padding: 8px 10px;
+          font-size: 0.8rem;
+        }
+
+        .authorCatalogHead {
+          background: #f8ece1;
+          color: #6d4f40;
+          font-weight: 700;
+        }
+
+        .authorCatalogRow {
+          border-top: 1px solid #f2e5db;
+          background: #fffdfb;
+          color: #6f5448;
+          text-align: left;
+          cursor: pointer;
+        }
+
+        .authorCatalogRow.active {
+          background: #ffe9d8;
+        }
+
+        .monoText {
+          font-family: "Fira Mono", var(--font-geist-mono), monospace;
+          font-size: 0.74rem;
+        }
+
+        .authorChip {
+          border: 1px solid #e8cdbb;
+          background: #fff8f1;
+          color: #6a4f43;
+          border-radius: 999px;
+          padding: 8px 12px;
+          font-size: 0.82rem;
+          cursor: pointer;
+          font-weight: 700;
+        }
+
+        .authorChip.active {
+          background: #ffd9c1;
+          border-color: #f2b990;
+          color: #563a2e;
+        }
+
+        .developerActivityGrid {
+          margin-top: 10px;
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 10px;
+        }
+
+        .developerColumn {
+          border: 1px solid #eedacc;
+          border-radius: 12px;
+          padding: 10px;
+          background: #fffaf5;
+          max-height: 360px;
+          overflow-y: auto;
+        }
+
+        .developerColumn h3 {
+          margin: 0 0 8px;
+          color: #5f4338;
+          font-size: 0.94rem;
+        }
+
+        .developerTimeline {
+          margin-top: 10px;
+          display: grid;
+          gap: 8px;
+          max-height: 460px;
+          overflow-y: auto;
+        }
+
+        .developerItem {
+          border: 1px solid #ecd8cb;
+          border-radius: 10px;
+          padding: 8px 10px;
+          background: #fffdfb;
+        }
+
+        .dateGroup {
+          margin-top: 8px;
+          display: grid;
+          gap: 8px;
+        }
+
+        .dateGroup h4 {
+          margin: 0;
+          color: #6a4f43;
+          font-size: 0.86rem;
+          border-left: 4px solid #f0b48d;
+          padding-left: 8px;
+        }
+
+        .typeBadge {
+          display: inline-block;
+          border-radius: 999px;
+          border: 1px solid #efc9b2;
+          background: #fff0e3;
+          color: #84563f;
+          padding: 2px 8px;
+          font-size: 0.75rem;
+          font-weight: 700;
+          margin-right: 6px;
+        }
+
+        .dangerBtn {
+          border-color: #efc1b9;
+          background: #fdebe7;
+          color: #9a3e35;
+        }
+
         .journalMeta {
           display: flex;
           justify-content: space-between;
           gap: 8px;
           font-size: 0.85rem;
+        }
+
+        .childTimeline {
+          margin-top: 10px;
+          display: grid;
+          gap: 10px;
+          max-height: 560px;
+          overflow-y: auto;
+        }
+
+        .timelineRow {
+          display: grid;
+          grid-template-columns: 140px 1fr;
+          gap: 10px;
+          border: 1px solid #edd9cc;
+          border-radius: 12px;
+          background: #fffdfb;
+          padding: 10px;
+        }
+
+        .timelineDate {
+          display: grid;
+          gap: 4px;
+          align-content: start;
+          border-right: 1px dashed #efcfbd;
+          padding-right: 8px;
+          color: #6a4e41;
+        }
+
+        .timelineDate span {
+          font-size: 0.82rem;
+          color: #856355;
+        }
+
+        .timelineBody {
+          display: grid;
+          gap: 6px;
+        }
+
+        .signalRow {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+        }
+
+        .signalBadge {
+          border-radius: 999px;
+          padding: 3px 8px;
+          font-size: 0.74rem;
+          font-weight: 700;
+          border: 1px solid transparent;
+        }
+
+        .signalBadge.risk {
+          background: #fde8e4;
+          color: #9a3b31;
+          border-color: #efbfb6;
+        }
+
+        .signalBadge.good {
+          background: #e8f6e8;
+          color: #2f7442;
+          border-color: #b8dfbf;
+        }
+
+        .signalBadge.warn {
+          background: #fff3df;
+          color: #8a6339;
+          border-color: #efd0a4;
+        }
+
+        .solutionBox {
+          margin-top: 4px;
+          border: 1px solid #efcdb4;
+          background: #fff3e8;
+          border-radius: 10px;
+          padding: 8px 10px;
+        }
+
+        .solutionBox h4 {
+          margin: 0 0 4px;
+          font-size: 0.84rem;
+          color: #764b35;
+        }
+
+        .solutionBox p {
+          margin: 0;
+          white-space: pre-wrap;
+          color: #684d40;
+          line-height: 1.45;
+        }
+
+        .textHighlight {
+          background: #ffe2ca;
+          color: #6a3f2b;
+          border-radius: 4px;
+          padding: 0 2px;
+          font-weight: 700;
         }
 
         .weeklyChart {
@@ -2764,6 +6800,121 @@ export default function Page() {
             #f4e7dd 6px,
             #f4e7dd 12px
           );
+        }
+
+        .lineChartWrap {
+          margin-top: 12px;
+          border: 1px solid #ecd8cb;
+          border-radius: 12px;
+          background: #fffdfb;
+          padding: 10px;
+        }
+
+        .lineChart {
+          width: 100%;
+          height: auto;
+          display: block;
+        }
+
+        .lineGrid {
+          stroke: #efdfd4;
+          stroke-width: 1;
+        }
+
+        .linePath {
+          fill: none;
+          stroke-width: 3;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+        }
+
+        .linePath.up {
+          stroke: #5eaa6f;
+        }
+
+        .linePath.down {
+          stroke: #d47366;
+        }
+
+        .linePoint {
+          stroke: #ffffff;
+          stroke-width: 1.5;
+          fill: #e3916f;
+        }
+
+        .linePoint.risk {
+          fill: #d6675b;
+        }
+
+        .lineLabel {
+          font-size: 11px;
+          fill: #795f53;
+          text-anchor: middle;
+        }
+
+        .insightGrid {
+          margin-top: 10px;
+          display: grid;
+          gap: 8px;
+        }
+
+        .insightChip {
+          border: 1px solid #edd9ca;
+          border-radius: 10px;
+          background: #fff8f2;
+          color: #6d5246;
+          font-size: 0.83rem;
+          padding: 8px 10px;
+        }
+
+        .analysisCards {
+          margin-top: 10px;
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 8px;
+        }
+
+        .analysisCard {
+          border: 1px solid #ecd8cb;
+          border-radius: 12px;
+          background: #fffdfb;
+          padding: 8px 10px;
+        }
+
+        .analysisCard h3 {
+          margin: 0;
+          font-size: 0.84rem;
+          color: #66493d;
+        }
+
+        .analysisCard p {
+          margin: 4px 0 0;
+          color: #72584c;
+          font-size: 0.82rem;
+          line-height: 1.4;
+          white-space: pre-wrap;
+        }
+
+        .fortuneWeeklyCard {
+          margin-top: 10px;
+          border: 1px solid #ecd6c8;
+          border-radius: 12px;
+          background: #fffbf8;
+          padding: 9px 10px;
+        }
+
+        .fortuneWeeklyCard h3 {
+          margin: 0;
+          color: #67493d;
+          font-size: 0.86rem;
+        }
+
+        .fortuneWeeklyCard p {
+          margin: 6px 0 0;
+          color: #6f554a;
+          font-size: 0.83rem;
+          line-height: 1.45;
+          white-space: pre-wrap;
         }
 
         .analysisBox,
@@ -3016,6 +7167,58 @@ export default function Page() {
           .childLayout,
           .testLayout {
             grid-template-columns: 1fr;
+          }
+
+          .counselWorkspace {
+            grid-template-columns: 1fr;
+          }
+
+          .threadSidebar {
+            position: static;
+          }
+
+          .developerActivityGrid {
+            grid-template-columns: 1fr;
+          }
+
+          .adminGrid {
+            grid-template-columns: 1fr;
+          }
+
+          .diaryDashboard,
+          .analysisCards {
+            grid-template-columns: 1fr;
+          }
+
+          .diaryWriterPanel {
+            max-height: none;
+            overflow: visible;
+          }
+
+          .analysisRangeInputs {
+            grid-template-columns: 1fr;
+          }
+
+          .donutWrap {
+            grid-template-columns: 1fr;
+            justify-items: center;
+          }
+
+          .timelineRow {
+            grid-template-columns: 1fr;
+          }
+
+          .timelineDate {
+            border-right: 0;
+            border-bottom: 1px dashed #efcfbd;
+            padding-right: 0;
+            padding-bottom: 6px;
+          }
+
+          .authorCatalogHead,
+          .authorCatalogRow {
+            grid-template-columns: 1fr;
+            gap: 4px;
           }
         }
 
