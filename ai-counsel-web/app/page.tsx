@@ -62,7 +62,8 @@ type TestId =
   | "depression-check"
   | "personality-test"
   | "sct-test";
-type TabId = "counsel" | "diary" | "child" | "tests" | "admin";
+type TabId = "counsel" | "diary" | "expert" | "child" | "tests" | "admin";
+type DiarySubTabId = "write" | "calendar" | "trend" | "analysis";
 type TechniqueId =
   | "gestalt"
   | "psychoanalysis"
@@ -499,7 +500,6 @@ const developerEmails = (process.env.NEXT_PUBLIC_DEVELOPER_EMAILS ?? "")
 
 const DEFAULT_ASSISTANT_MESSAGE =
   "종합 상담에 오신 것을 환영합니다. 먼저 카테고리를 고르고 고민과 상황을 적어주세요.";
-const REFLECTION_PROMPT_DAILY_LIMIT = 3;
 const reflectionPromptThemes = [
   "오늘 가장 기억에 남는 순간",
   "오늘 나를 지치게 한 장면",
@@ -754,10 +754,15 @@ function emotionSummaryText(emotions: string[], mood: number, energy: number) {
   if (emotions.length === 0) {
     return "감정을 선택하면 오늘 정서 요약이 여기에 표시됩니다.";
   }
-  const negative = emotions.filter((emotion) =>
-    ["불안", "우울", "분노", "피곤", "외로움", "답답함"].includes(emotion)
-  );
+  const negative = emotions.filter((emotion) => ["불안", "우울", "분노", "피곤", "외로움", "답답함"].includes(emotion));
   const positive = emotions.filter((emotion) => ["기쁨", "감사", "평온", "희망"].includes(emotion));
+  const custom = emotions.filter((emotion) => ![...emotionOptions].includes(emotion));
+  if (negative.length === 0 && positive.length === 0 && custom.length > 0) {
+    const focus = custom.slice(0, 2).join(" + ");
+    const energyNote = energy <= 4 ? "에너지가 낮아 휴식 우선이 좋아요." : "";
+    const moodNote = mood <= 4 ? "불편한 감정은 짧게라도 기록해 두세요." : "";
+    return `오늘은 ${focus} 감정이 두드러집니다. 감정을 구체화한 기록은 분석 정확도를 높입니다. ${energyNote} ${moodNote}`.trim();
+  }
   const center =
     negative.length >= positive.length
       ? `${negative.slice(0, 2).join(" + ")} 중심`
@@ -771,6 +776,100 @@ function emotionSummaryText(emotions: string[], mood: number, energy: number) {
   const energyNote = energy <= 4 ? "에너지가 낮아 휴식 우선이 좋아요." : "";
   const moodNote = mood <= 4 ? "불편한 감정은 짧게라도 기록해 두세요." : "";
   return `오늘은 ${center}. ${tone} ${energyNote} ${moodNote}`.trim();
+}
+
+function inferEmotionTone(emotion: string, mood: number, energy: number): "positive" | "neutral" | "negative" {
+  if (["기쁨", "감사", "평온", "희망"].includes(emotion)) return "positive";
+  if (["불안", "우울", "분노", "외로움"].includes(emotion)) return "negative";
+  if (["피곤", "답답함"].includes(emotion)) return "neutral";
+
+  const token = emotion.trim().toLowerCase();
+  const positiveHints = ["안도", "설렘", "행복", "뿌듯", "만족", "신남", "자신", "편안", "회복", "안정"];
+  const negativeHints = ["허무", "불편", "초조", "두려", "걱정", "스트레스", "짜증", "공허", "지침", "우울"];
+  const neutralHints = ["멍", "덤덤", "무난", "보통", "차분", "잔잔", "복잡"];
+
+  if (positiveHints.some((hint) => token.includes(hint))) return "positive";
+  if (negativeHints.some((hint) => token.includes(hint))) return "negative";
+  if (neutralHints.some((hint) => token.includes(hint))) return "neutral";
+
+  const stateScore = mood * 0.7 + energy * 0.3;
+  if (stateScore >= 6.7) return "positive";
+  if (stateScore <= 4.3) return "negative";
+  return "neutral";
+}
+
+function buildDailyAiComment(entries: JournalEntry[]) {
+  if (entries.length === 0) {
+    return "이 날짜에는 기록이 없습니다. 짧게 3줄만 적어도 맞춤 코멘트를 받을 수 있어요.";
+  }
+
+  const avgMood = averageMood(entries.map((entry) => entry.mood));
+  const avgEnergy = averageMood(entries.map((entry) => entry.energy));
+  const toneCounts = { positive: 0, neutral: 0, negative: 0 };
+
+  for (const entry of entries) {
+    for (const emotion of entry.emotions) {
+      const tone = inferEmotionTone(emotion, entry.mood, entry.energy);
+      toneCounts[tone] += 1;
+    }
+  }
+
+  const dominantTone =
+    toneCounts.negative >= toneCounts.positive && toneCounts.negative >= toneCounts.neutral
+      ? "negative"
+      : toneCounts.positive >= toneCounts.neutral
+      ? "positive"
+      : "neutral";
+
+  const stateLine =
+    avgMood <= 4
+      ? `오늘은 부담 신호가 큽니다 (기분 ${avgMood}/10).`
+      : avgMood >= 7
+      ? `오늘은 회복 흐름이 좋습니다 (기분 ${avgMood}/10).`
+      : `오늘은 변동이 있는 균형 구간입니다 (기분 ${avgMood}/10).`;
+
+  const actionLine =
+    dominantTone === "negative"
+      ? "실천: 해야 할 일을 1개만 최소 단위로 쪼개서 완료해 보세요."
+      : dominantTone === "positive"
+      ? "실천: 도움이 된 루틴 1개를 내일도 같은 시간에 반복해 보세요."
+      : avgEnergy <= 4
+      ? "실천: 에너지 회복용 짧은 휴식(10분 산책/스트레칭)을 먼저 넣어보세요."
+      : "실천: 오늘 감정 변동을 만든 사건 1개를 메모해 패턴을 남겨보세요.";
+
+  return `${stateLine} ${actionLine}`;
+}
+
+function extractEmotionSignalsFromText(text: string) {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return [] as string[];
+
+  const keywordMap: Array<{ emotion: string; keywords: string[] }> = [
+    { emotion: "기쁨", keywords: ["기쁘", "행복", "즐거", "신나", "좋았", "뿌듯", "재밌"] },
+    { emotion: "감사", keywords: ["감사", "고마", "고맙", "든든"] },
+    { emotion: "평온", keywords: ["평온", "차분", "편안", "안정", "잔잔", "무난"] },
+    { emotion: "불안", keywords: ["불안", "초조", "긴장", "조마", "걱정", "두려"] },
+    { emotion: "우울", keywords: ["우울", "무기력", "침울", "공허", "허무", "의욕 없", "무의미"] },
+    { emotion: "분노", keywords: ["분노", "화가", "짜증", "열받", "억울", "분했"] },
+    { emotion: "피곤", keywords: ["피곤", "지침", "지쳤", "힘들", "탈진", "기운 없", "무겁"] },
+    { emotion: "외로움", keywords: ["외롭", "쓸쓸", "고독", "혼자", "고립"] },
+    { emotion: "답답함", keywords: ["답답", "막막", "갑갑", "숨막", "복잡"] },
+    { emotion: "희망", keywords: ["희망", "기대", "해낼", "가능", "나아질", "회복될"] },
+  ];
+
+  const signals: string[] = [];
+  for (const { emotion, keywords } of keywordMap) {
+    let hit = 0;
+    for (const keyword of keywords) {
+      if (normalized.includes(keyword)) hit += 1;
+    }
+    const repeat = Math.min(2, hit);
+    for (let i = 0; i < repeat; i += 1) {
+      signals.push(emotion);
+    }
+  }
+
+  return signals;
 }
 
 function extractKeySentence(reflection: string) {
@@ -863,6 +962,7 @@ const googleProvider = new GoogleAuthProvider();
 
 export default function Page() {
   const [activeTab, setActiveTab] = useState<TabId>("counsel");
+  const [activeDiarySubTab, setActiveDiarySubTab] = useState<DiarySubTabId>("write");
   const [uid, setUid] = useState<string | null>(null);
   const [guestSessionId, setGuestSessionId] = useState<string | null>(null);
   const [authEmail, setAuthEmail] = useState("");
@@ -916,6 +1016,8 @@ export default function Page() {
   const [relationship, setRelationship] = useState(5);
   const [achievement, setAchievement] = useState(5);
   const [emotions, setEmotions] = useState<string[]>([]);
+  const [customEmotionInput, setCustomEmotionInput] = useState("");
+  const [customEmotions, setCustomEmotions] = useState<string[]>([]);
   const [reflection, setReflection] = useState("");
   const [healthSettings, setHealthSettings] = useState<HealthSettings>({
     enabled: false,
@@ -1519,10 +1621,13 @@ export default function Page() {
     () => averageMood([mood, energy, relationship, achievement]),
     [achievement, energy, mood, relationship]
   );
-  const todayCompositeScore = useMemo(() => scoreFromMood(todayCompositeMood), [todayCompositeMood]);
+  const diaryEmotions = useMemo(
+    () => [...emotions, ...customEmotions.map((emotion) => emotion.trim()).filter(Boolean)],
+    [customEmotions, emotions]
+  );
   const emotionSummary = useMemo(
-    () => emotionSummaryText(emotions, mood, energy),
-    [emotions, energy, mood]
+    () => emotionSummaryText(diaryEmotions, mood, energy),
+    [diaryEmotions, energy, mood]
   );
   const reflectionLength = useMemo(() => composedDiaryText.trim().length, [composedDiaryText]);
   const keySentence = useMemo(() => extractKeySentence(composedDiaryText), [composedDiaryText]);
@@ -1536,34 +1641,6 @@ export default function Page() {
     }
     return "부담 강도가 높아 보입니다. 오늘 가장 힘든 순간 1개와 그때 든 생각을 분리해 적어보세요.";
   }, [liveCommentEnabled, todayCompositeMood]);
-  const emotionDonut = useMemo(() => {
-    const positive = emotions.filter((emotion) => ["기쁨", "감사", "평온", "희망"].includes(emotion)).length;
-    const neutral = emotions.filter((emotion) => ["피곤", "답답함"].includes(emotion)).length;
-    const negative = emotions.filter((emotion) => ["불안", "우울", "분노", "외로움"].includes(emotion)).length;
-    const total = positive + neutral + negative;
-    if (total === 0) {
-      return {
-        gradient: "conic-gradient(#f1dfd2 0deg 360deg)",
-        labels: [
-          { key: "긍정", value: 0, color: "#4e8d5d" },
-          { key: "중립", value: 0, color: "#ba814b" },
-          { key: "부담", value: 0, color: "#c45a4d" },
-        ],
-      };
-    }
-    const positiveDeg = Math.round((positive / total) * 360);
-    const neutralDeg = Math.round((neutral / total) * 360);
-    return {
-      gradient: `conic-gradient(#5daa6e 0deg ${positiveDeg}deg, #e3a35f ${positiveDeg}deg ${
-        positiveDeg + neutralDeg
-      }deg, #d16b5e ${positiveDeg + neutralDeg}deg 360deg)`,
-      labels: [
-        { key: "긍정", value: positive, color: "#4e8d5d" },
-        { key: "중립", value: neutral, color: "#ba814b" },
-        { key: "부담", value: negative, color: "#c45a4d" },
-      ],
-    };
-  }, [emotions]);
   const weeklyLineMeta = useMemo(() => {
     const width = 420;
     const height = 160;
@@ -1875,6 +1952,59 @@ export default function Page() {
   const selectedDiaryEntries = useMemo(() => {
     return journalList.filter((entry) => entry.date === journalDate);
   }, [journalDate, journalList]);
+  const calendarCompositeMood = useMemo(() => {
+    if (selectedDiaryEntries.length === 0) return null;
+    const avgMood = averageMood(selectedDiaryEntries.map((entry) => entry.mood));
+    const avgEnergy = averageMood(selectedDiaryEntries.map((entry) => entry.energy));
+    const avgRelationship = averageMood(selectedDiaryEntries.map((entry) => entry.relationship));
+    const avgAchievement = averageMood(selectedDiaryEntries.map((entry) => entry.achievement));
+    return averageMood([avgMood, avgEnergy, avgRelationship, avgAchievement]);
+  }, [selectedDiaryEntries]);
+  const calendarCompositeScore = useMemo(
+    () => (calendarCompositeMood === null ? 0 : scoreFromMood(calendarCompositeMood)),
+    [calendarCompositeMood]
+  );
+  const calendarEmotionDonut = useMemo(() => {
+    let positive = 0;
+    let neutral = 0;
+    let negative = 0;
+
+    for (const entry of selectedDiaryEntries) {
+      const textSignals = extractEmotionSignalsFromText(entry.reflection || entry.text || "");
+      const merged = [...entry.emotions, ...textSignals];
+      for (const emotion of merged) {
+        const tone = inferEmotionTone(emotion, entry.mood, entry.energy);
+        if (tone === "positive") positive += 1;
+        if (tone === "neutral") neutral += 1;
+        if (tone === "negative") negative += 1;
+      }
+    }
+
+    const total = positive + neutral + negative;
+    if (total === 0) {
+      return {
+        gradient: "conic-gradient(#f1dfd2 0deg 360deg)",
+        labels: [
+          { key: "긍정", value: 0, color: "#4e8d5d" },
+          { key: "중립", value: 0, color: "#ba814b" },
+          { key: "부담", value: 0, color: "#c45a4d" },
+        ],
+      };
+    }
+    const positiveDeg = Math.round((positive / total) * 360);
+    const neutralDeg = Math.round((neutral / total) * 360);
+    return {
+      gradient: `conic-gradient(#5daa6e 0deg ${positiveDeg}deg, #e3a35f ${positiveDeg}deg ${
+        positiveDeg + neutralDeg
+      }deg, #d16b5e ${positiveDeg + neutralDeg}deg 360deg)`,
+      labels: [
+        { key: "긍정", value: positive, color: "#4e8d5d" },
+        { key: "중립", value: neutral, color: "#ba814b" },
+        { key: "부담", value: negative, color: "#c45a4d" },
+      ],
+    };
+  }, [selectedDiaryEntries]);
+  const dailyAiComment = useMemo(() => buildDailyAiComment(selectedDiaryEntries), [selectedDiaryEntries]);
 
   const childWeeklyPoints = useMemo<ChildPoint[]>(() => {
     const byDate = new Map<string, ChildEntry>();
@@ -2336,12 +2466,6 @@ export default function Page() {
 
   function addReflectionPrompt() {
     const used = getReflectionPromptUsage(journalDate);
-    if (used >= REFLECTION_PROMPT_DAILY_LIMIT) {
-      setReflectionPromptCount(used);
-      setReflectionPromptMessage("오늘은 보조 질문을 3번 모두 사용했습니다.");
-      return;
-    }
-
     const available = reflectionPromptPool.filter((prompt) => !reflection.includes(prompt));
     const pool = available.length > 0 ? available : reflectionPromptPool;
     const prompt = pool[Math.floor(Math.random() * pool.length)];
@@ -2350,7 +2474,7 @@ export default function Page() {
     const nextCount = used + 1;
     setReflectionPromptUsage(journalDate, nextCount);
     setReflectionPromptCount(nextCount);
-    setReflectionPromptMessage(`보조 질문 사용 ${nextCount}/${REFLECTION_PROMPT_DAILY_LIMIT}`);
+    setReflectionPromptMessage(`보조 질문 사용 ${nextCount}회`);
   }
 
   function addFortuneMissionPrompt() {
@@ -2372,6 +2496,17 @@ export default function Page() {
     setMedicationTimes((prev) =>
       prev.includes(time) ? prev.filter((value) => value !== time) : [...prev, time]
     );
+  }
+
+  function addCustomEmotion() {
+    const value = customEmotionInput.trim();
+    if (!value) return;
+    setCustomEmotions((prev) => [...prev, value]);
+    setCustomEmotionInput("");
+  }
+
+  function removeCustomEmotion(indexToRemove: number) {
+    setCustomEmotions((prev) => prev.filter((_, index) => index !== indexToRemove));
   }
 
   async function saveHealthSettings(next: HealthSettings) {
@@ -2444,7 +2579,7 @@ export default function Page() {
       energy,
       relationship,
       achievement,
-      emotions,
+      emotions: diaryEmotions,
       reflection: composedDiaryText.trim(),
       text: composedDiaryText.trim(),
     };
@@ -2471,6 +2606,8 @@ export default function Page() {
       setRelationship(5);
       setAchievement(5);
       setEmotions([]);
+      setCustomEmotionInput("");
+      setCustomEmotions([]);
       setDiaryMode("general");
       setFortuneMissionDone(false);
       setHealthSectionOpen(false);
@@ -2499,7 +2636,11 @@ export default function Page() {
     setEnergy(entry.energy);
     setRelationship(entry.relationship);
     setAchievement(entry.achievement);
-    setEmotions(entry.emotions);
+    const selectedPresetEmotions = entry.emotions.filter((emotion) => emotionOptions.includes(emotion));
+    const typedCustomEmotions = entry.emotions.filter((emotion) => !emotionOptions.includes(emotion));
+    setEmotions(selectedPresetEmotions);
+    setCustomEmotionInput("");
+    setCustomEmotions(typedCustomEmotions);
     setDiaryMode(entry.mode ?? "general");
     setFortuneMissionDone(Boolean(entry.missionCompleted));
     setHealthSectionOpen(Boolean(entry.medicationRecord));
@@ -2527,6 +2668,8 @@ export default function Page() {
     setRelationship(5);
     setAchievement(5);
     setEmotions([]);
+    setCustomEmotionInput("");
+    setCustomEmotions([]);
     setDiaryMode("general");
     setFortuneMissionDone(false);
     setHealthSectionOpen(false);
@@ -3312,6 +3455,12 @@ export default function Page() {
                 관리자 페이지
               </button>
             )}
+            <button
+              className={`tabBtn ${activeTab === "expert" ? "active" : ""}`}
+              onClick={() => setActiveTab("expert")}
+            >
+              전문가에게 요청하기
+            </button>
           </section>
 
           {activeTab === "counsel" && (
@@ -3478,11 +3627,37 @@ export default function Page() {
 
           {activeTab === "diary" && (
             <section className="diaryLayout">
-              <article className="panel full cozyScene" aria-hidden>
+              <article className="panel full cozyScene diaryScene">
                 <div className="sceneMoon" />
                 <div className="sceneMug" />
                 <div className="sceneBook" />
                 <p>따뜻한 공간에서 오늘의 마음을 천천히 기록해보세요.</p>
+                <div className="diarySubTabs" role="tablist" aria-label="하루 일기 하위 카테고리">
+                  <button
+                    className={`diarySubTabBtn ${activeDiarySubTab === "write" ? "active" : ""}`}
+                    onClick={() => setActiveDiarySubTab("write")}
+                  >
+                    오늘 일기 작성
+                  </button>
+                  <button
+                    className={`diarySubTabBtn ${activeDiarySubTab === "calendar" ? "active" : ""}`}
+                    onClick={() => setActiveDiarySubTab("calendar")}
+                  >
+                    일기 달력
+                  </button>
+                  <button
+                    className={`diarySubTabBtn ${activeDiarySubTab === "trend" ? "active" : ""}`}
+                    onClick={() => setActiveDiarySubTab("trend")}
+                  >
+                    최근 7일 감정 추이
+                  </button>
+                  <button
+                    className={`diarySubTabBtn ${activeDiarySubTab === "analysis" ? "active" : ""}`}
+                    onClick={() => setActiveDiarySubTab("analysis")}
+                  >
+                    AI 분석
+                  </button>
+                </div>
               </article>
               {healthSettingsOpen && (
                 <div className="healthModalOverlay">
@@ -3554,6 +3729,7 @@ export default function Page() {
                   </article>
                 </div>
               )}
+              {activeDiarySubTab === "write" && (
               <article className="panel diaryWriterPanel">
                 <h2>오늘 일기 작성</h2>
                 <div className="diaryForm">
@@ -3765,6 +3941,40 @@ export default function Page() {
                         );
                       })}
                     </div>
+                    <label>
+                      기타(직접 입력)
+                      <div className="customEmotionInputRow">
+                        <input
+                          value={customEmotionInput}
+                          onChange={(e) => setCustomEmotionInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              addCustomEmotion();
+                            }
+                          }}
+                          placeholder="예: 허무함, 안도감, 기대됨"
+                        />
+                        <button type="button" className="ghostBtn" onClick={addCustomEmotion}>
+                          추가
+                        </button>
+                      </div>
+                    </label>
+                    {customEmotions.length > 0 && (
+                      <div className="customEmotionList">
+                        {customEmotions.map((emotion, index) => (
+                          <button
+                            key={`custom-emotion-${index}-${emotion}`}
+                            type="button"
+                            className="modeChip active"
+                            onClick={() => removeCustomEmotion(index)}
+                            title="클릭하면 제거"
+                          >
+                            {emotion} ×
+                          </button>
+                        ))}
+                      </div>
+                    )}
                     <p className="liveSummary">{emotionSummary}</p>
                   </div>
 
@@ -3813,15 +4023,11 @@ export default function Page() {
                       type="button"
                       className="ghostBtn"
                       onClick={addReflectionPrompt}
-                      disabled={reflectionPromptCount >= REFLECTION_PROMPT_DAILY_LIMIT}
                     >
                       보조 질문 넣기
                     </button>
                   </div>
-                  <p className="summaryText">
-                    보조 질문 남은 횟수: {Math.max(0, REFLECTION_PROMPT_DAILY_LIMIT - reflectionPromptCount)}/
-                    {REFLECTION_PROMPT_DAILY_LIMIT}
-                  </p>
+                  <p className="summaryText">보조 질문 사용 횟수: {reflectionPromptCount}</p>
                   {reflectionPromptMessage && <p className="summaryText">{reflectionPromptMessage}</p>}
                   <div className="keySentenceBox">
                     <strong>오늘의 핵심 문장</strong>
@@ -3847,43 +4053,10 @@ export default function Page() {
                   )}
                   {saveStatus && <p className="statusText">{saveStatus}</p>}
                 </div>
-                <div className="diaryDashboard">
-                  <div className="metricCard">
-                    <h3>오늘 종합 점수</h3>
-                    <div className="gaugeWrap">
-                      <svg viewBox="0 0 120 120" className="gaugeSvg" role="img" aria-label="오늘 종합 점수">
-                        <circle cx="60" cy="60" r="48" className="gaugeTrack" />
-                        <circle
-                          cx="60"
-                          cy="60"
-                          r="48"
-                          className="gaugeValue"
-                          style={{ strokeDasharray: `${Math.round((todayCompositeScore / 100) * 302)} 302` }}
-                        />
-                      </svg>
-                      <div className="gaugeCenter">
-                        <strong>{todayCompositeScore}</strong>
-                        <span>{todayCompositeMood}/10</span>
-                      </div>
-                    </div>
-                  </div>
-                  <div className="metricCard">
-                    <h3>감정 분포</h3>
-                    <div className="donutWrap">
-                      <div className="donutChart" style={{ backgroundImage: emotionDonut.gradient }} />
-                      <div className="donutLegend">
-                        {emotionDonut.labels.map((item) => (
-                          <p key={item.key}>
-                            <span className="legendDot" style={{ background: item.color }} />
-                            {item.key} {item.value}
-                          </p>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-                </div>
               </article>
+              )}
 
+              {activeDiarySubTab === "calendar" && (
               <article className="panel diaryCalendarPanel">
                 <h2>일기 달력</h2>
                 <div className="calendarHead">
@@ -3967,6 +4140,45 @@ export default function Page() {
                   <span>평균 {weeklyStats.average ?? "-"}</span>
                   <span>추세 {weeklyStats.trend}</span>
                 </div>
+                <div className="diaryDashboard">
+                  <div className="metricCard">
+                    <h3>선택 날짜 종합 점수</h3>
+                    <div className="gaugeWrap">
+                      <svg viewBox="0 0 120 120" className="gaugeSvg" role="img" aria-label="선택 날짜 종합 점수">
+                        <circle cx="60" cy="60" r="48" className="gaugeTrack" />
+                        <circle
+                          cx="60"
+                          cy="60"
+                          r="48"
+                          className="gaugeValue"
+                          style={{ strokeDasharray: `${Math.round((calendarCompositeScore / 100) * 302)} 302` }}
+                        />
+                      </svg>
+                      <div className="gaugeCenter">
+                        <strong>{selectedDiaryEntries.length === 0 ? "-" : calendarCompositeScore}</strong>
+                        <span>{calendarCompositeMood === null ? "-" : `${calendarCompositeMood}/10`}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="metricCard">
+                    <h3>감정 분포 (입력+소감 분석)</h3>
+                    <div className="donutWrap">
+                      <div className="donutChart" style={{ backgroundImage: calendarEmotionDonut.gradient }} />
+                      <div className="donutLegend">
+                        {calendarEmotionDonut.labels.map((item) => (
+                          <p key={item.key}>
+                            <span className="legendDot" style={{ background: item.color }} />
+                            {item.key} {item.value}
+                          </p>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div className="dailyAiCommentBox">
+                  <strong>{journalDate} AI 코멘트</strong>
+                  <p>{dailyAiComment}</p>
+                </div>
                 <div className="dayEntryList">
                   <div className="panelHeadRow">
                     <h3>{journalDate} 작성 일기</h3>
@@ -4021,54 +4233,7 @@ export default function Page() {
                   )}
                 </div>
               </article>
-
-              <article className="panel">
-                <h2>전문가에게 요청하기</h2>
-                <div className="diaryForm">
-                  <label>
-                    요청 카테고리
-                    <select value={expertCategory} onChange={(e) => setExpertCategory(e.target.value)}>
-                      <option value="일기 피드백">일기 피드백</option>
-                      <option value="감정 조절">감정 조절</option>
-                      <option value="관계 고민">관계 고민</option>
-                      <option value="육아 고민">육아 고민</option>
-                      <option value="기타">기타</option>
-                    </select>
-                  </label>
-                  <label>
-                    요청 내용
-                    <textarea
-                      value={expertRequestText}
-                      onChange={(e) => setExpertRequestText(e.target.value)}
-                      placeholder="관리자(전문가)에게 받고 싶은 조언을 구체적으로 적어주세요."
-                      rows={4}
-                    />
-                  </label>
-                  <button className="primaryBtn" onClick={submitExpertRequest}>
-                    요청 등록
-                  </button>
-                </div>
-                <div className="dayEntryList">
-                  <h3>내 요청 목록</h3>
-                  {expertRequests.length === 0 && <p className="emptyText">등록된 요청이 없습니다.</p>}
-                  {expertRequests.map((request) => (
-                    <div key={`expert-request-${request.id}`} className="dayEntryCard">
-                      <p className="summaryText">
-                        [{request.category}] 상태: {request.status === "answered" ? "답변 완료" : "답변 대기"}
-                      </p>
-                      <p>{request.requestText}</p>
-                      {request.advisorReply ? (
-                        <div className="solutionBox">
-                          <h4>관리자 조언</h4>
-                          <p>{request.advisorReply}</p>
-                        </div>
-                      ) : (
-                        <p className="summaryText">아직 관리자 조언이 등록되지 않았습니다.</p>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </article>
+              )}
 
               {isDeveloper && (
                 <article className="panel full">
@@ -4207,6 +4372,7 @@ export default function Page() {
                 </article>
               )}
 
+              {activeDiarySubTab === "trend" && (
               <article className="panel">
                 <h2>최근 7일 감정 추이</h2>
                 <p className="summaryText">
@@ -4269,7 +4435,9 @@ export default function Page() {
                   <div className="insightChip">이번 달 가장 안정적이었던 날: {diaryInsights.strongestDay}</div>
                 </div>
               </article>
+              )}
 
+              {activeDiarySubTab === "analysis" && (
               <article className="panel">
                 <div className="analysisHeadRow">
                   <h2>AI 분석</h2>
@@ -4361,7 +4529,60 @@ export default function Page() {
                   </>
                 )}
               </article>
+              )}
 
+            </section>
+          )}
+
+          {activeTab === "expert" && (
+            <section className="diaryLayout">
+              <article className="panel">
+                <h2>전문가에게 요청하기</h2>
+                <div className="diaryForm">
+                  <label>
+                    요청 카테고리
+                    <select value={expertCategory} onChange={(e) => setExpertCategory(e.target.value)}>
+                      <option value="일기 피드백">일기 피드백</option>
+                      <option value="감정 조절">감정 조절</option>
+                      <option value="관계 고민">관계 고민</option>
+                      <option value="육아 고민">육아 고민</option>
+                      <option value="기타">기타</option>
+                    </select>
+                  </label>
+                  <label>
+                    요청 내용
+                    <textarea
+                      value={expertRequestText}
+                      onChange={(e) => setExpertRequestText(e.target.value)}
+                      placeholder="관리자(전문가)에게 받고 싶은 조언을 구체적으로 적어주세요."
+                      rows={4}
+                    />
+                  </label>
+                  <button className="primaryBtn" onClick={submitExpertRequest}>
+                    요청 등록
+                  </button>
+                </div>
+                <div className="dayEntryList">
+                  <h3>내 요청 목록</h3>
+                  {expertRequests.length === 0 && <p className="emptyText">등록된 요청이 없습니다.</p>}
+                  {expertRequests.map((request) => (
+                    <div key={`expert-request-${request.id}`} className="dayEntryCard">
+                      <p className="summaryText">
+                        [{request.category}] 상태: {request.status === "answered" ? "답변 완료" : "답변 대기"}
+                      </p>
+                      <p>{request.requestText}</p>
+                      {request.advisorReply ? (
+                        <div className="solutionBox">
+                          <h4>관리자 조언</h4>
+                          <p>{request.advisorReply}</p>
+                        </div>
+                      ) : (
+                        <p className="summaryText">아직 관리자 조언이 등록되지 않았습니다.</p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </article>
             </section>
           )}
 
@@ -5785,6 +6006,36 @@ export default function Page() {
           font-size: 0.95rem;
         }
 
+        .diaryScene {
+          align-items: start;
+          row-gap: 12px;
+        }
+
+        .diarySubTabs {
+          grid-column: 1 / -1;
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+        }
+
+        .diarySubTabBtn {
+          border: 1px solid #ebd8c8;
+          background: #fffaf6;
+          padding: 10px 14px;
+          border-radius: 12px;
+          font-weight: 700;
+          cursor: pointer;
+          color: #70564b;
+          transition: all 0.2s ease;
+        }
+
+        .diarySubTabBtn.active {
+          background: linear-gradient(135deg, #f6a779 0%, #ee876f 100%);
+          border-color: #e98a68;
+          color: #fff;
+          box-shadow: 0 8px 18px rgba(238, 135, 111, 0.3);
+        }
+
         .sceneMoon {
           width: 42px;
           height: 42px;
@@ -6101,6 +6352,22 @@ export default function Page() {
         }
 
         .emotionGrid {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+        }
+
+        .customEmotionInputRow {
+          display: flex;
+          gap: 8px;
+          align-items: center;
+        }
+
+        .customEmotionInputRow .ghostBtn {
+          flex-shrink: 0;
+        }
+
+        .customEmotionList {
           display: flex;
           flex-wrap: wrap;
           gap: 8px;
@@ -6483,6 +6750,28 @@ export default function Page() {
           padding: 4px 8px;
           font-size: 0.78rem;
           font-weight: 700;
+        }
+
+        .dailyAiCommentBox {
+          margin-top: 8px;
+          border: 1px solid #edd8c9;
+          border-radius: 12px;
+          background: #fff8f1;
+          padding: 10px;
+          display: grid;
+          gap: 4px;
+        }
+
+        .dailyAiCommentBox strong {
+          color: #66493d;
+          font-size: 0.86rem;
+        }
+
+        .dailyAiCommentBox p {
+          margin: 0;
+          color: #6f5448;
+          font-size: 0.84rem;
+          line-height: 1.45;
         }
 
         .diaryWriterPanel {
@@ -7243,6 +7532,20 @@ export default function Page() {
           .menuStrip {
             grid-template-columns: repeat(2, minmax(90px, 1fr));
           }
+
+          .diarySubTabs {
+            flex-wrap: nowrap;
+            overflow-x: auto;
+            padding-bottom: 2px;
+            -webkit-overflow-scrolling: touch;
+            scrollbar-width: thin;
+          }
+
+          .diarySubTabBtn {
+            flex: 0 0 auto;
+            min-height: 40px;
+            white-space: nowrap;
+          }
         }
 
         @keyframes rise {
@@ -7259,3 +7562,5 @@ export default function Page() {
     </main>
   );
 }
+
+// ping_from_terminal
