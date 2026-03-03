@@ -808,12 +808,16 @@ function buildDailyAiComment(entries: JournalEntry[]) {
   const toneCounts = { positive: 0, neutral: 0, negative: 0 };
 
   for (const entry of entries) {
-    for (const emotion of entry.emotions) {
+    const textSignals = extractEmotionSignalsFromText(entry.reflection || entry.text || "");
+    const merged = [...entry.emotions, ...textSignals];
+    for (const emotion of merged) {
       const tone = inferEmotionTone(emotion, entry.mood, entry.energy);
       toneCounts[tone] += 1;
     }
   }
 
+  const totalSignals = toneCounts.positive + toneCounts.neutral + toneCounts.negative;
+  const balance = totalSignals > 0 ? (toneCounts.positive - toneCounts.negative) / totalSignals : 0;
   const dominantTone =
     toneCounts.negative >= toneCounts.positive && toneCounts.negative >= toneCounts.neutral
       ? "negative"
@@ -822,10 +826,12 @@ function buildDailyAiComment(entries: JournalEntry[]) {
       : "neutral";
 
   const stateLine =
-    avgMood <= 4
-      ? `오늘은 부담 신호가 큽니다 (기분 ${avgMood}/10).`
-      : avgMood >= 7
-      ? `오늘은 회복 흐름이 좋습니다 (기분 ${avgMood}/10).`
+    avgMood >= 7 && balance < 0
+      ? `기분 점수는 높지만 부담 감정 비중이 더 큽니다 (기분 ${avgMood}/10).`
+      : avgMood <= 4 || balance <= -0.2
+      ? `오늘은 부담 신호가 우세합니다 (기분 ${avgMood}/10).`
+      : avgMood >= 7 || balance >= 0.2
+      ? `오늘은 회복 흐름이 우세합니다 (기분 ${avgMood}/10).`
       : `오늘은 변동이 있는 균형 구간입니다 (기분 ${avgMood}/10).`;
 
   const actionLine =
@@ -837,7 +843,8 @@ function buildDailyAiComment(entries: JournalEntry[]) {
       ? "실천: 에너지 회복용 짧은 휴식(10분 산책/스트레칭)을 먼저 넣어보세요."
       : "실천: 오늘 감정 변동을 만든 사건 1개를 메모해 패턴을 남겨보세요.";
 
-  return `${stateLine} ${actionLine}`;
+  const distributionLine = `감정 분포: 긍정 ${toneCounts.positive} · 중립 ${toneCounts.neutral} · 부담 ${toneCounts.negative}`;
+  return `${stateLine} ${distributionLine} ${actionLine}`;
 }
 
 function extractEmotionSignalsFromText(text: string) {
@@ -1958,7 +1965,26 @@ export default function Page() {
     const avgEnergy = averageMood(selectedDiaryEntries.map((entry) => entry.energy));
     const avgRelationship = averageMood(selectedDiaryEntries.map((entry) => entry.relationship));
     const avgAchievement = averageMood(selectedDiaryEntries.map((entry) => entry.achievement));
-    return averageMood([avgMood, avgEnergy, avgRelationship, avgAchievement]);
+    const baseMood = averageMood([avgMood, avgEnergy, avgRelationship, avgAchievement]);
+
+    let positive = 0;
+    let negative = 0;
+    for (const entry of selectedDiaryEntries) {
+      const textSignals = extractEmotionSignalsFromText(entry.reflection || entry.text || "");
+      const merged = [...entry.emotions, ...textSignals];
+      for (const emotion of merged) {
+        const tone = inferEmotionTone(emotion, entry.mood, entry.energy);
+        if (tone === "positive") positive += 1;
+        if (tone === "negative") negative += 1;
+      }
+    }
+
+    const total = positive + negative;
+    if (total === 0) return baseMood;
+
+    const balance = (positive - negative) / total;
+    const adjustedMood = baseMood + balance * 1.5;
+    return Number(Math.max(1, Math.min(10, adjustedMood)).toFixed(1));
   }, [selectedDiaryEntries]);
   const calendarCompositeScore = useMemo(
     () => (calendarCompositeMood === null ? 0 : scoreFromMood(calendarCompositeMood)),
